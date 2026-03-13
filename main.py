@@ -602,6 +602,55 @@ async def cleanup_stale(days: int = 30):
 
 
 # ---------------------------------------------------------------------------
+# Product Catalog routes
+# ---------------------------------------------------------------------------
+
+from catalog import (
+    list_projects, get_project, upsert_project,
+    delete_project, search_projects, count_projects,
+)
+
+
+@app.get("/catalog")
+async def catalog_list():
+    """List all projects in the catalog."""
+    projects = list_projects()
+    return {"projects": projects, "count": len(projects)}
+
+
+@app.get("/catalog/search")
+async def catalog_search(q: str, top_k: int = 5):
+    """Search projects by natural language query."""
+    results = search_projects(q, top_k)
+    return {"query": q, "results": results}
+
+
+@app.get("/catalog/{name}")
+async def catalog_get(name: str):
+    """Get a project by name."""
+    project = get_project(name)
+    if not project:
+        raise HTTPException(404, f"Project not found: {name}")
+    return project
+
+
+@app.post("/catalog")
+async def catalog_upsert(entry: dict):
+    """Add or update a project in the catalog."""
+    if "name" not in entry:
+        raise HTTPException(400, "Missing 'name' field")
+    point_id = upsert_project(entry)
+    return {"status": "ok", "name": entry["name"], "point_id": point_id}
+
+
+@app.delete("/catalog/{name}")
+async def catalog_delete(name: str):
+    """Delete a project from the catalog."""
+    delete_project(name)
+    return {"status": "deleted", "name": name}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
