@@ -1,9 +1,13 @@
 """
-Erudito v1.0 — Knowledge Orchestration Agent for the KUBO AI-Lab mesh.
+Erudito v2.0 — Knowledge Orchestration Agent for the KUBO AI-Lab mesh.
 
-Replaces index_docs.py with an intelligent curator that:
+Intelligent RAG pipeline that:
 - Scans git repos for changes (incremental via git diff)
 - Chunks and embeds documents
+- LLM-enriched analysis (summary, concepts, tags, relevance scoring)
+- Cosine-similarity deduplication
+- Semantic search endpoint
+- Quality/coverage metrics
 - Curates Qdrant agent_knowledge collection (insert/update/delete)
 - Anti-RAG-poison filtering (regex-based)
 - Audit logging
@@ -19,7 +23,13 @@ import subprocess
 import urllib.request
 from datetime import datetime, timezone
 
+import logging
+
 from fastapi import FastAPI, HTTPException
+
+from analyzer import analyze_chunk, batch_analyze
+
+logger = logging.getLogger("erudito")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -28,6 +38,7 @@ from fastapi import FastAPI, HTTPException
 SCAN_SOURCES = [
     {"path": os.path.expanduser("~/desarrollos_openclaw/claude_contracts"), "type": "docs", "node": "hanzo"},
     {"path": os.path.expanduser("~/desarrollos_openclaw/opencode_contracts"), "type": "docs", "node": "hanzo"},
+    {"path": os.path.expanduser("~/desarrollos_openclaw/proyectos/jasper_3.0/agents/profiles"), "type": "docs", "node": "hanzo"},
     {"path": os.path.expanduser("~/ai-lab/infra-mcp"), "type": "code", "node": "hanzo"},
     {"path": os.path.expanduser("~/ai-lab/devops-agent"), "type": "code", "node": "hanzo"},
     {"path": os.path.expanduser("~/ai-lab/mesh-monitor"), "type": "code", "node": "hanzo"},
@@ -60,10 +71,15 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text:latest")
 COLLECTION = "agent_knowledge"
-SIMILARITY_THRESHOLD = 0.92
+SIMILARITY_THRESHOLD = float(os.getenv("ERUDITO_SIMILARITY_THRESHOLD", "0.92"))
 
 CHUNK_SIZE = 800  # chars
 CHUNK_OVERLAP = 150
+
+# --- v2 Feature flags ---
+ANALYZER_ENABLED = os.getenv("ERUDITO_ANALYZER_ENABLED", "true").lower() == "true"
+DEDUP_ENABLED = os.getenv("ERUDITO_DEDUP_ENABLED", "true").lower() == "true"
+MIN_RELEVANCE = float(os.getenv("ERUDITO_MIN_RELEVANCE", "0.3"))
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 STATE_FILE = os.path.join(DATA_DIR, "scan_state.json")
@@ -329,6 +345,47 @@ def delete_by_source(source_file: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Single-text embedding helper
+# ---------------------------------------------------------------------------
+
+
+def embed_text(text: str) -> list[float]:
+    """Embed a single text string. Convenience wrapper around embed_texts."""
+    return embed_texts([text])[0]
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+
+def is_duplicate(embedding: list[float], threshold: float = SIMILARITY_THRESHOLD) -> tuple[bool, float]:
+    """Check if a very similar chunk already exists in Qdrant.
+
+    Returns (is_dup, best_score).
+    """
+    if not DEDUP_ENABLED:
+        return False, 0.0
+    try:
+        result = _qdrant_request(
+            f"/collections/{COLLECTION}/points/search",
+            data={
+                "vector": embedding,
+                "limit": 1,
+                "score_threshold": threshold,
+                "with_payload": False,
+            },
+            method="POST",
+        )
+        hits = result.get("result", [])
+        if hits:
+            return True, hits[0].get("score", 0.0)
+        return False, 0.0
+    except Exception:
+        return False, 0.0  # On error, allow the upsert
+
+
+# ---------------------------------------------------------------------------
 # Main scan orchestrator
 # ---------------------------------------------------------------------------
 
@@ -339,7 +396,11 @@ async def run_scan(sources: list[dict] | None = None) -> dict:
         sources = SCAN_SOURCES
 
     state = load_scan_state()
-    stats = {"scanned": 0, "inserted": 0, "updated": 0, "deleted": 0, "skipped": 0, "poisoned": 0, "errors": []}
+    stats = {
+        "scanned": 0, "inserted": 0, "updated": 0, "deleted": 0,
+        "skipped": 0, "poisoned": 0, "analyzed": 0, "skipped_relevance": 0,
+        "skipped_dedup": 0, "errors": [],
+    }
 
     for source in sources:
         path = source["path"]
@@ -389,8 +450,51 @@ async def run_scan(sources: list[dict] | None = None) -> dict:
                 stats["skipped"] += 1
                 continue
 
-            # Embed all chunks in batch
-            texts = [c["text"] for c in chunks]
+            # --- v2: Analyzer enrichment ---
+            enrichments = [None] * len(chunks)
+            if ANALYZER_ENABLED and chunks:
+                try:
+                    analyzed = batch_analyze(
+                        chunks, source=full_path,
+                        doc_type=source.get("type", "docs"),
+                        min_relevance=MIN_RELEVANCE,
+                    )
+                    for i, result in enumerate(analyzed):
+                        if result["action"] == "skip":
+                            enrichments[i] = "skip"
+                            stats["skipped_relevance"] += 1
+                            audit_log({
+                                "action": "skip_relevance",
+                                "source": full_path,
+                                "chunk_index": i,
+                                "relevance_score": result["analysis"].get("relevance_score", 0),
+                            })
+                        else:
+                            enrichments[i] = result
+                            stats["analyzed"] += 1
+                            audit_log({
+                                "action": "analyze_success",
+                                "source": full_path,
+                                "chunk_index": i,
+                                "model": result.get("model", ""),
+                            })
+                except Exception as exc:
+                    logger.warning("Analyzer failed for %s, proceeding without enrichment: %s", full_path, exc)
+                    audit_log({"action": "analyze_fail", "source": full_path, "error": str(exc)})
+
+            # Filter out chunks skipped by relevance
+            active_chunks = []
+            for i, chunk in enumerate(chunks):
+                if enrichments[i] == "skip":
+                    continue
+                active_chunks.append((chunk, enrichments[i]))
+
+            if not active_chunks:
+                stats["skipped"] += 1
+                continue
+
+            # Embed all active chunks in batch
+            texts = [c["text"] for c, _ in active_chunks]
             try:
                 embeddings = embed_texts(texts)
             except Exception as e:
@@ -405,9 +509,21 @@ async def run_scan(sources: list[dict] | None = None) -> dict:
             else:
                 stats["inserted"] += 1
 
-            # Build points for batch upsert
+            # Build points for batch upsert, with dedup check
             batch_points = []
-            for chunk, emb in zip(chunks, embeddings):
+            for (chunk, enrichment), emb in zip(active_chunks, embeddings):
+                # --- v2: Dedup check ---
+                dup, dup_score = is_duplicate(emb, SIMILARITY_THRESHOLD)
+                if dup:
+                    stats["skipped_dedup"] += 1
+                    audit_log({
+                        "action": "skip_dedup",
+                        "source": full_path,
+                        "chunk_index": chunk["chunk_index"],
+                        "similarity": round(dup_score, 4),
+                    })
+                    continue
+
                 point_id = _generate_point_id(full_path, chunk["chunk_index"])
                 payload = {
                     "source": full_path,
@@ -418,7 +534,22 @@ async def run_scan(sources: list[dict] | None = None) -> dict:
                     "text": chunk["text"],
                     "last_verified": _now_iso(),
                 }
+
+                # Merge enrichment metadata if available
+                if enrichment and isinstance(enrichment, dict):
+                    enriched_chunk = enrichment.get("chunk", {})
+                    payload["summary"] = enriched_chunk.get("summary", "")
+                    payload["concepts"] = enriched_chunk.get("concepts", [])
+                    payload["tags"] = enriched_chunk.get("tags", [])
+                    payload["relevance_score"] = enriched_chunk.get("relevance_score")
+                    payload["doc_type"] = enriched_chunk.get("doc_type", "")
+                    payload["dependencies"] = enriched_chunk.get("dependencies", [])
+
                 batch_points.append({"id": point_id, "vector": emb, "payload": payload})
+
+            if not batch_points:
+                stats["skipped"] += 1
+                continue
 
             try:
                 upsert_points(batch_points)
@@ -443,8 +574,8 @@ async def run_scan(sources: list[dict] | None = None) -> dict:
 
 app = FastAPI(
     title="Erudito",
-    version="1.0.0",
-    description="Knowledge Orchestration Agent — KUBO AI-Lab",
+    version="2.0.0",
+    description="Intelligent RAG Pipeline — KUBO AI-Lab",
 )
 
 
@@ -473,7 +604,7 @@ async def health():
 
     return {
         "status": "ok" if (qdrant_ok and ollama_ok) else "degraded",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "agent": "erudito",
         "qdrant": "ok" if qdrant_ok else "unreachable",
         "ollama": "ok" if ollama_ok else "unreachable",
@@ -599,6 +730,150 @@ async def cleanup_stale(days: int = 30):
 
     audit_log({"action": "staleness_cleanup", "days": days, "deleted": deleted})
     return {"status": "completed", "deleted": deleted, "cutoff": cutoff_str}
+
+
+# ---------------------------------------------------------------------------
+# v2: Search endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/search")
+async def search_knowledge(q: str, top_k: int = 5, min_score: float = 0.3):
+    """Semantic search over agent_knowledge collection."""
+    if not q or len(q.strip()) < 3:
+        raise HTTPException(status_code=400, detail="Query must be at least 3 characters")
+
+    try:
+        embedding = embed_text(q.strip())
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Embedding service unavailable: {e}")
+
+    try:
+        result = _qdrant_request(
+            f"/collections/{COLLECTION}/points/search",
+            data={
+                "vector": embedding,
+                "limit": top_k,
+                "score_threshold": min_score,
+                "with_payload": True,
+            },
+            method="POST",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Qdrant search failed: {e}")
+
+    hits = result.get("result", [])
+    return {
+        "query": q,
+        "results": [
+            {
+                "score": round(hit.get("score", 0), 4),
+                "text": hit.get("payload", {}).get("text", ""),
+                "source": hit.get("payload", {}).get("source", ""),
+                "node": hit.get("payload", {}).get("node", ""),
+                "type": hit.get("payload", {}).get("type", ""),
+                # Enrichment fields (empty if not yet analyzed)
+                "summary": hit.get("payload", {}).get("summary", ""),
+                "concepts": hit.get("payload", {}).get("concepts", []),
+                "tags": hit.get("payload", {}).get("tags", []),
+                "relevance_score": hit.get("payload", {}).get("relevance_score"),
+                "doc_type": hit.get("payload", {}).get("doc_type", ""),
+            }
+            for hit in hits
+        ],
+        "total": len(hits),
+    }
+
+
+# ---------------------------------------------------------------------------
+# v2: Metrics endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Return quality and coverage metrics for the knowledge base."""
+    try:
+        req = urllib.request.Request(f"{QDRANT_URL}/collections/{COLLECTION}")
+        resp = urllib.request.urlopen(req, timeout=5)
+        collection_info = json.loads(resp.read()).get("result", {})
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Qdrant unreachable: {e}")
+
+    total_points = collection_info.get("points_count", 0)
+    vectors_count = collection_info.get("vectors_count", 0)
+    segments_count = collection_info.get("segments_count")
+
+    # Sample points to compute stats
+    try:
+        sample_result = _qdrant_request(
+            f"/collections/{COLLECTION}/points/scroll",
+            data={"limit": 200, "with_payload": True, "with_vectors": False},
+            method="POST",
+        )
+        points = sample_result.get("result", {}).get("points", [])
+    except Exception:
+        points = []
+
+    enriched = sum(1 for p in points if p.get("payload", {}).get("relevance_score") is not None)
+    high_quality = sum(1 for p in points if (p.get("payload", {}).get("relevance_score") or 0) > 0.7)
+    has_concepts = sum(1 for p in points if p.get("payload", {}).get("concepts"))
+    has_summary = sum(1 for p in points if p.get("payload", {}).get("summary"))
+
+    # Source distribution
+    sources = {}
+    for p in points:
+        src = p.get("payload", {}).get("source", "unknown")
+        parts = src.split("/")
+        # Extract meaningful directory name
+        repo = parts[0] if parts else "unknown"
+        for i, part in enumerate(parts):
+            if part in ("ai-lab", "desarrollos_openclaw") and i + 1 < len(parts):
+                repo = parts[i + 1]
+                break
+        sources[repo] = sources.get(repo, 0) + 1
+
+    sample_size = len(points)
+
+    return {
+        "total_points": total_points,
+        "sample_size": sample_size,
+        "enrichment": {
+            "enriched_pct": round(enriched / sample_size * 100, 1) if sample_size else 0,
+            "high_quality_pct": round(high_quality / sample_size * 100, 1) if sample_size else 0,
+            "has_concepts_pct": round(has_concepts / sample_size * 100, 1) if sample_size else 0,
+            "has_summary_pct": round(has_summary / sample_size * 100, 1) if sample_size else 0,
+        },
+        "sources": dict(sorted(sources.items(), key=lambda x: -x[1])),
+        "collection": {
+            "vectors_count": vectors_count,
+            "segments_count": segments_count,
+        },
+        "feature_flags": {
+            "analyzer_enabled": ANALYZER_ENABLED,
+            "dedup_enabled": DEDUP_ENABLED,
+            "min_relevance": MIN_RELEVANCE,
+            "similarity_threshold": SIMILARITY_THRESHOLD,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# v2: Reindex endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.post("/reindex")
+async def force_reindex():
+    """Force full re-index of all sources with LLM enrichment."""
+    audit_log({"action": "reindex_start"})
+
+    # Clear scan state to force full rescan
+    save_scan_state({})
+
+    stats = await run_scan()
+    audit_log({"action": "reindex_complete", "stats": {k: v for k, v in stats.items() if k != "errors"}})
+    return {"status": "completed", "stats": stats}
 
 
 # ---------------------------------------------------------------------------
