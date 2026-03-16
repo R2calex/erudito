@@ -67,3 +67,4 @@ def test_batch_analyze():
     assert len(skipped) >= 1, "Expected at least 1 skipped chunk"
     assert len(indexed) >= 1, "Expected at least 1 indexed chunk"
 
+# dedup test
