@@ -1,934 +1,402 @@
+"""Erudito v3 — Knowledge Orchestration Agent with NotebookLM Integration.
+
+FastAPI application with modular domain separation.
+Background scan loop, confidence-based query routing, dual-write registry.
 """
-Erudito v2.0 — Knowledge Orchestration Agent for the KUBO AI-Lab mesh.
-
-Intelligent RAG pipeline that:
-- Scans git repos for changes (incremental via git diff)
-- Chunks and embeds documents
-- LLM-enriched analysis (summary, concepts, tags, relevance scoring)
-- Cosine-similarity deduplication
-- Semantic search endpoint
-- Quality/coverage metrics
-- Curates Qdrant agent_knowledge collection (insert/update/delete)
-- Anti-RAG-poison filtering (regex-based)
-- Audit logging
-
-Run: uvicorn main:app --host 0.0.0.0 --port 8095
-"""
-
-import hashlib
+import asyncio
 import json
-import os
-import re
-import subprocess
-import urllib.request
-from datetime import datetime, timezone
-
 import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse
 
-from analyzer import analyze_chunk, batch_analyze
+from core.registry import Registry
+from core.scanner import compute_delta
+from core.indexer import (
+    index_delta, ensure_collection, embed_text, search,
+    COLLECTION_KNOWLEDGE, COLLECTION_NLM_NOTES,
+)
+from core.query import execute_query
+from integrations.sanitizer import sanitize_text
+from integrations import notebooklm as nlm
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("erudito")
 
-# ---------------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
-
-SCAN_SOURCES = [
-    {"path": os.path.expanduser("~/desarrollos_openclaw/claude_contracts"), "type": "docs", "node": "hanzo"},
-    {"path": os.path.expanduser("~/desarrollos_openclaw/opencode_contracts"), "type": "docs", "node": "hanzo"},
-    {"path": os.path.expanduser("~/desarrollos_openclaw/proyectos/jasper_3.0/agents/profiles"), "type": "docs", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/infra-mcp"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/devops-agent"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/mesh-monitor"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/event-bus"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/node-reporter"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/qdrant-mcp"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/erudito"), "type": "code", "node": "hanzo"},
-]
-
-REMOTE_SOURCES = [
-    {"path": "~/ai-lab/", "type": "code", "node": "kubo", "ssh": "r0calex@100.66.123.113"},
-    {"path": "~/ai-lab/", "type": "code", "node": "sariatu", "ssh": "sariatu"},
-]
-
-SCAN_EXTENSIONS = {".md", ".py", ".yml", ".yaml", ".json", ".sh", ".toml", ".cfg"}
-EXCLUDED_FILES = {".env", "credentials.json", "auth-profiles.json", "join_token.txt", "package-lock.json"}
-EXCLUDED_DIRS = {"node_modules", ".git", "__pycache__", ".pytest_cache", "venv", ".venv", "data"}
-
-POISON_PATTERNS = [
-    re.compile(r"password\s*[:=]\s*['\"]?[^\s'\"]{8,}", re.IGNORECASE),
-    re.compile(r"api[_-]?key\s*[:=]\s*['\"]?[a-zA-Z0-9_-]{20,}", re.IGNORECASE),
-    re.compile(r"token\s*[:=]\s*['\"]?[a-zA-Z0-9._-]{20,}", re.IGNORECASE),
-    re.compile(r"postgresql://[^:]+:[^@]+@"),
-    re.compile(r"sk-[a-zA-Z0-9]{20,}"),
-    re.compile(r"Bearer\s+[a-zA-Z0-9._-]{20,}"),
-    re.compile(r"BEGIN\s+(RSA|DSA|EC|OPENSSH)\s+PRIVATE\s+KEY"),
-]
-
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text:latest")
-COLLECTION = "agent_knowledge"
-SIMILARITY_THRESHOLD = float(os.getenv("ERUDITO_SIMILARITY_THRESHOLD", "0.92"))
-
-CHUNK_SIZE = 800  # chars
-CHUNK_OVERLAP = 150
-
-# --- v2 Feature flags ---
-ANALYZER_ENABLED = os.getenv("ERUDITO_ANALYZER_ENABLED", "true").lower() == "true"
-DEDUP_ENABLED = os.getenv("ERUDITO_DEDUP_ENABLED", "true").lower() == "true"
-MIN_RELEVANCE = float(os.getenv("ERUDITO_MIN_RELEVANCE", "0.3"))
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-STATE_FILE = os.path.join(DATA_DIR, "scan_state.json")
+DATA_DIR = os.getenv("DATA_DIR", "data")
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_MINUTES", "15")) * 60
+REGISTRY_YAML = os.path.join(DATA_DIR, "registry.yaml")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.jsonl")
+REDIS_URL = os.getenv("REDIS_URL", None)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# Global state
+registry: Registry | None = None
+_scan_task: asyncio.Task | None = None
+_coherence_cache: dict = {"score": None, "timestamp": None}
+_nlm_call_stats: dict = {"success": 0, "total": 0}
+_query_stats: dict = {"high": 0, "total": 0}
+_last_scan_time: str | None = None
+_auto_enriched_files: int = 0
+_total_scanned_files: int = 0
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-
-
-def _should_scan(filepath: str) -> bool:
-    """Return True if the file should be scanned based on extension/exclusion rules."""
-    basename = os.path.basename(filepath)
-    if basename in EXCLUDED_FILES:
-        return False
-    _, ext = os.path.splitext(basename)
-    if ext not in SCAN_EXTENSIONS:
-        return False
-    parts = filepath.replace("\\", "/").split("/")
-    for part in parts:
-        if part in EXCLUDED_DIRS:
-            return False
-    return True
-
-
-def _has_poison(content: str) -> bool:
-    """Check if content matches any anti-RAG-poison pattern."""
-    for pat in POISON_PATTERNS:
-        if pat.search(content):
-            return True
-    return False
-
-
-def _generate_point_id(source: str, chunk_index: int) -> int:
-    """Generate a deterministic 64-bit int ID from source + chunk_index."""
-    h = hashlib.md5(f"{source}:{chunk_index}".encode()).hexdigest()
-    return int(h[:16], 16)
-
-
-# ---------------------------------------------------------------------------
-# Scan state & audit
-# ---------------------------------------------------------------------------
-
-
-def load_scan_state() -> dict:
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def save_scan_state(state: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    return datetime.now(timezone.utc).isoformat()
 
 
 def audit_log(entry: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
+    """Append to JSONL audit file."""
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     entry["timestamp"] = _now_iso()
     with open(AUDIT_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Git scanner
-# ---------------------------------------------------------------------------
-
-
-def _find_git_root(path: str) -> str | None:
-    """Find the git root for a path (may be a parent directory)."""
-    result = subprocess.run(
-        ["git", "-C", path, "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, timeout=5,
-    )
-    if result.returncode == 0:
-        return result.stdout.strip()
-    return None
-
-
-def scan_repo(source: dict) -> tuple[list[str], list[str], str]:
-    """Scan a git repo for changes since last scan.
-
-    The scan path may be a subdirectory of a git repo. In that case,
-    git commands run from the git root, and file paths are filtered
-    to only include files under the scan path.
-
-    Returns (changed_files, deleted_files, head_commit).
-    Files are returned as paths relative to source["path"].
-    """
-    path = source["path"]
-    git_root = _find_git_root(path)
-    if not git_root:
-        raise RuntimeError(f"Not a git repo: {path}")
-
-    # If scan path is a subdir of git root, compute the prefix
-    abs_path = os.path.abspath(path)
-    abs_root = os.path.abspath(git_root)
-    if abs_path == abs_root:
-        subdir_prefix = ""
-    else:
-        subdir_prefix = os.path.relpath(abs_path, abs_root)
-        if not subdir_prefix.endswith("/"):
-            subdir_prefix += "/"
-
-    state = load_scan_state()
-    last_commit = state.get(path, {}).get("last_commit", "")
-
-    if last_commit:
-        # Check if last_commit still exists in the repo
-        check = subprocess.run(
-            ["git", "-C", git_root, "cat-file", "-t", last_commit],
-            capture_output=True, text=True, timeout=5,
-        )
-        if check.returncode != 0:
-            last_commit = ""
-
-    if last_commit:
-        cmd = ["git", "-C", git_root, "diff", "--name-only", last_commit, "HEAD"]
-        if subdir_prefix:
-            cmd.extend(["--", subdir_prefix])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        changed_files = [f for f in result.stdout.strip().split("\n") if f]
-
-        cmd_del = ["git", "-C", git_root, "diff", "--name-only", "--diff-filter=D", last_commit, "HEAD"]
-        if subdir_prefix:
-            cmd_del.extend(["--", subdir_prefix])
-        result_deleted = subprocess.run(cmd_del, capture_output=True, text=True, timeout=10)
-        deleted_files = [f for f in result_deleted.stdout.strip().split("\n") if f]
-    else:
-        cmd = ["git", "-C", git_root, "ls-files"]
-        if subdir_prefix:
-            cmd.append(subdir_prefix)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        changed_files = [f for f in result.stdout.strip().split("\n") if f]
-        deleted_files = []
-
-    # Strip subdir prefix so paths are relative to scan path
-    if subdir_prefix:
-        changed_files = [f[len(subdir_prefix):] for f in changed_files if f.startswith(subdir_prefix)]
-        deleted_files = [f[len(subdir_prefix):] for f in deleted_files if f.startswith(subdir_prefix)]
-
-    changed_files = [f for f in changed_files if _should_scan(f)]
-
-    head = subprocess.run(
-        ["git", "-C", git_root, "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=5,
-    ).stdout.strip()
-
-    return changed_files, deleted_files, head
-
-
-# ---------------------------------------------------------------------------
-# Chunking
-# ---------------------------------------------------------------------------
-
-
-def chunk_text(text: str, filename: str) -> list[dict]:
-    """Split text into overlapping chunks with metadata."""
-    chunks = []
-    step = CHUNK_SIZE - CHUNK_OVERLAP
-    if step <= 0:
-        step = CHUNK_SIZE
-    idx = 0
-    for i in range(0, len(text), step):
-        chunk = text[i : i + CHUNK_SIZE]
-        if len(chunk.strip()) < 50:
-            continue
-        chunks.append({
-            "text": chunk,
-            "source": filename,
-            "offset": i,
-            "chunk_index": idx,
-        })
-        idx += 1
-    return chunks
-
-
-# ---------------------------------------------------------------------------
-# Qdrant operations (raw REST API)
-# ---------------------------------------------------------------------------
-
-
-def _qdrant_request(path: str, data: dict | None = None, method: str | None = None, timeout: int = 15):
-    """Send a request to Qdrant REST API."""
-    url = f"{QDRANT_URL}{path}"
-    if data is not None:
-        payload = json.dumps(data).encode()
-        req = urllib.request.Request(
-            url, data=payload, method=method or "POST",
-            headers={"Content-Type": "application/json"},
-        )
-    else:
-        req = urllib.request.Request(url, method=method or "GET")
-    resp = urllib.request.urlopen(req, timeout=timeout)
-    return json.loads(resp.read())
-
-
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Get embeddings from Ollama. Process in batches to avoid timeouts."""
-    BATCH_SIZE = 32
-    all_embeddings = []
-    for i in range(0, len(texts), BATCH_SIZE):
-        batch = texts[i : i + BATCH_SIZE]
-        payload = json.dumps({"model": EMBED_MODEL, "input": batch}).encode()
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/embed",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        resp = urllib.request.urlopen(req, timeout=120)
-        data = json.loads(resp.read())
-        all_embeddings.extend(data["embeddings"])
-    return all_embeddings
-
-
-def upsert_points(points: list[dict]):
-    """Upsert a batch of points to Qdrant."""
-    if not points:
-        return
-    # Batch in groups of 100
-    BATCH = 100
-    for i in range(0, len(points), BATCH):
-        batch = points[i : i + BATCH]
-        _qdrant_request(
-            f"/collections/{COLLECTION}/points",
-            data={"points": batch},
-            method="PUT",
-            timeout=30,
-        )
-
-
-def delete_by_source(source_file: str) -> int:
-    """Delete all chunks from a specific source file."""
-    filter_payload = {
-        "filter": {"must": [{"key": "source", "match": {"value": source_file}}]},
-        "limit": 500,
-        "with_payload": False,
-    }
-    try:
-        result = _qdrant_request(
-            f"/collections/{COLLECTION}/points/scroll",
-            data=filter_payload,
-            method="POST",
-        )
-    except Exception:
-        return 0
-
-    points = result.get("result", {}).get("points", [])
-    if points:
-        ids = [p["id"] for p in points]
-        _qdrant_request(
-            f"/collections/{COLLECTION}/points/delete",
-            data={"points": ids},
-            method="POST",
-        )
-    return len(points)
-
-
-# ---------------------------------------------------------------------------
-# Single-text embedding helper
-# ---------------------------------------------------------------------------
-
-
-def embed_text(text: str) -> list[float]:
-    """Embed a single text string. Convenience wrapper around embed_texts."""
-    return embed_texts([text])[0]
-
-
-# ---------------------------------------------------------------------------
-# Deduplication
-# ---------------------------------------------------------------------------
-
-
-def is_duplicate(embedding: list[float], threshold: float = SIMILARITY_THRESHOLD) -> tuple[bool, float]:
-    """Check if a very similar chunk already exists in Qdrant.
-
-    Returns (is_dup, best_score).
-    """
-    if not DEDUP_ENABLED:
-        return False, 0.0
-    try:
-        result = _qdrant_request(
-            f"/collections/{COLLECTION}/points/search",
-            data={
-                "vector": embedding,
-                "limit": 1,
-                "score_threshold": threshold,
-                "with_payload": False,
-            },
-            method="POST",
-        )
-        hits = result.get("result", [])
-        if hits:
-            return True, hits[0].get("score", 0.0)
-        return False, 0.0
-    except Exception:
-        return False, 0.0  # On error, allow the upsert
-
-
-# ---------------------------------------------------------------------------
-# Main scan orchestrator
-# ---------------------------------------------------------------------------
-
-
-async def run_scan(sources: list[dict] | None = None) -> dict:
-    """Run a full scan cycle."""
-    if sources is None:
-        sources = SCAN_SOURCES
-
-    state = load_scan_state()
-    stats = {
-        "scanned": 0, "inserted": 0, "updated": 0, "deleted": 0,
-        "skipped": 0, "poisoned": 0, "analyzed": 0, "skipped_relevance": 0,
-        "skipped_dedup": 0, "errors": [],
-    }
-
-    for source in sources:
-        path = source["path"]
-        if not os.path.isdir(path):
-            stats["errors"].append(f"Directory not found: {path}")
-            continue
-
-        # Check if it's inside a git repo
-        if not _find_git_root(path):
-            stats["errors"].append(f"Not a git repo: {path}")
-            continue
-
+async def _scan_loop():
+    """Background scan loop running every SCAN_INTERVAL seconds."""
+    while True:
         try:
-            changed, deleted, head = scan_repo(source)
+            await _run_scan_all()
         except Exception as e:
-            stats["errors"].append(f"Scan error {path}: {e}")
-            continue
-
-        # Handle deleted files
-        for f in deleted:
-            full_source = os.path.join(path, f)
-            count = delete_by_source(full_source)
-            stats["deleted"] += count
-            audit_log({"action": "delete", "source": full_source, "chunks_deleted": count})
-
-        # Process changed files
-        for f in changed:
-            full_path = os.path.join(path, f)
-            if not os.path.isfile(full_path):
-                continue
-
-            try:
-                with open(full_path, encoding="utf-8", errors="ignore") as fh:
-                    content = fh.read()
-            except Exception:
-                continue
-
-            # Anti-poison check
-            if _has_poison(content):
-                stats["poisoned"] += 1
-                audit_log({"action": "skip_poison", "source": full_path})
-                continue
-
-            # Chunk the file
-            chunks = chunk_text(content, full_path)
-            if not chunks:
-                stats["skipped"] += 1
-                continue
-
-            # --- v2: Analyzer enrichment ---
-            enrichments = [None] * len(chunks)
-            if ANALYZER_ENABLED and chunks:
-                try:
-                    analyzed = batch_analyze(
-                        chunks, source=full_path,
-                        doc_type=source.get("type", "docs"),
-                        min_relevance=MIN_RELEVANCE,
-                    )
-                    for i, result in enumerate(analyzed):
-                        if result["action"] == "skip":
-                            enrichments[i] = "skip"
-                            stats["skipped_relevance"] += 1
-                            audit_log({
-                                "action": "skip_relevance",
-                                "source": full_path,
-                                "chunk_index": i,
-                                "relevance_score": result["analysis"].get("relevance_score", 0),
-                            })
-                        else:
-                            enrichments[i] = result
-                            stats["analyzed"] += 1
-                            audit_log({
-                                "action": "analyze_success",
-                                "source": full_path,
-                                "chunk_index": i,
-                                "model": result.get("model", ""),
-                            })
-                except Exception as exc:
-                    logger.warning("Analyzer failed for %s, proceeding without enrichment: %s", full_path, exc)
-                    audit_log({"action": "analyze_fail", "source": full_path, "error": str(exc)})
-
-            # Filter out chunks skipped by relevance
-            active_chunks = []
-            for i, chunk in enumerate(chunks):
-                if enrichments[i] == "skip":
-                    continue
-                active_chunks.append((chunk, enrichments[i]))
-
-            if not active_chunks:
-                stats["skipped"] += 1
-                continue
-
-            # Embed all active chunks in batch
-            texts = [c["text"] for c, _ in active_chunks]
-            try:
-                embeddings = embed_texts(texts)
-            except Exception as e:
-                stats["errors"].append(f"Embed error {full_path}: {e}")
-                audit_log({"action": "embed_error", "source": full_path, "error": str(e)})
-                continue
-
-            # Delete old chunks for this file (clean slate)
-            old_deleted = delete_by_source(full_path)
-            if old_deleted > 0:
-                stats["updated"] += 1
-            else:
-                stats["inserted"] += 1
-
-            # Build points for batch upsert, with dedup check
-            batch_points = []
-            for (chunk, enrichment), emb in zip(active_chunks, embeddings):
-                # --- v2: Dedup check ---
-                dup, dup_score = is_duplicate(emb, SIMILARITY_THRESHOLD)
-                if dup:
-                    stats["skipped_dedup"] += 1
-                    audit_log({
-                        "action": "skip_dedup",
-                        "source": full_path,
-                        "chunk_index": chunk["chunk_index"],
-                        "similarity": round(dup_score, 4),
-                    })
-                    continue
-
-                point_id = _generate_point_id(full_path, chunk["chunk_index"])
-                payload = {
-                    "source": full_path,
-                    "node": source.get("node", "unknown"),
-                    "type": source.get("type", "unknown"),
-                    "chunk_index": chunk["chunk_index"],
-                    "offset": chunk["offset"],
-                    "text": chunk["text"],
-                    "last_verified": _now_iso(),
-                }
-
-                # Merge enrichment metadata if available
-                if enrichment and isinstance(enrichment, dict):
-                    enriched_chunk = enrichment.get("chunk", {})
-                    payload["summary"] = enriched_chunk.get("summary", "")
-                    payload["concepts"] = enriched_chunk.get("concepts", [])
-                    payload["tags"] = enriched_chunk.get("tags", [])
-                    payload["relevance_score"] = enriched_chunk.get("relevance_score")
-                    payload["doc_type"] = enriched_chunk.get("doc_type", "")
-                    payload["dependencies"] = enriched_chunk.get("dependencies", [])
-
-                batch_points.append({"id": point_id, "vector": emb, "payload": payload})
-
-            if not batch_points:
-                stats["skipped"] += 1
-                continue
-
-            try:
-                upsert_points(batch_points)
-            except Exception as e:
-                stats["errors"].append(f"Upsert error {full_path}: {e}")
-                audit_log({"action": "upsert_error", "source": full_path, "error": str(e)})
-                continue
-
-            stats["scanned"] += 1
-
-        # Update scan state
-        state[path] = {"last_commit": head, "last_scan": _now_iso()}
-
-    save_scan_state(state)
-    audit_log({"action": "scan_complete", "stats": {k: v for k, v in stats.items() if k != "errors"}})
-    return stats
+            logger.error(f"Scan loop error: {e}")
+            audit_log({"action": "scan_error", "error": str(e)})
+        await asyncio.sleep(SCAN_INTERVAL)
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
+async def _run_scan_all():
+    """Scan all projects for deltas and process them."""
+    global _last_scan_time
+    if not registry:
+        return
+    for project_name in registry.list_all():
+        await _scan_project(project_name)
+    _last_scan_time = _now_iso()
 
-app = FastAPI(
-    title="Erudito",
-    version="2.0.0",
-    description="Intelligent RAG Pipeline — KUBO AI-Lab",
-)
 
+async def _scan_project(project_name: str):
+    """Scan a single project for changes."""
+    entry = registry.get(project_name)
+    if not entry:
+        return
+
+    repo_path = os.path.expanduser(entry["path"])
+    if not os.path.isdir(repo_path):
+        logger.warning(f"Path not found for {project_name}: {repo_path}")
+        return
+
+    delta = compute_delta(project_name, repo_path, entry.get("last_hash"))
+    if not delta:
+        return  # No changes
+
+    logger.info(f"Delta detected for {project_name}: {len(delta['files'])} files changed")
+    audit_log({"action": "delta_detected", "project": project_name, "files": len(delta["files"])})
+
+    # Sanitize all files in the delta
+    for file_info in delta["files"]:
+        if file_info["content"]:
+            result = await sanitize_text(file_info["content"])
+            file_info["content"] = result["sanitized"]
+            if result["masked_count"] > 0:
+                logger.info(f"Sanitized {result['masked_count']} secrets in {file_info['path']}")
+
+    # Track auto-enrichment for metadata compliance metric
+    global _auto_enriched_files, _total_scanned_files
+    for f in delta["files"]:
+        if f["action"] != "deleted":
+            _total_scanned_files += 1
+            if f.get("auto_enriched"):
+                _auto_enriched_files += 1
+
+    # Run Indexer and NLM cycle in parallel
+    indexer_task = asyncio.create_task(_run_indexer(project_name, delta))
+    nlm_task = asyncio.create_task(_run_nlm_cycle(project_name, delta))
+
+    await asyncio.gather(indexer_task, nlm_task, return_exceptions=True)
+
+
+async def _run_indexer(project_name: str, delta: dict):
+    """Run the indexer pipeline."""
+    try:
+        count = index_delta(delta)
+        doc_count = len([f for f in delta["files"] if f["action"] != "deleted"])
+        registry.update_sync(project_name, delta["new_hash"], doc_count=doc_count)
+        logger.info(f"Indexed {count} points for {project_name}")
+        audit_log({"action": "index_complete", "project": project_name, "points": count})
+    except Exception as e:
+        logger.error(f"Indexer failed for {project_name}: {e}")
+        audit_log({"action": "index_error", "project": project_name, "error": str(e)})
+
+
+async def _run_nlm_cycle(project_name: str, delta: dict):
+    """Run the NotebookLM validation cycle."""
+    entry = registry.get(project_name)
+    if not entry:
+        return
+
+    notebook_id = entry.get("notebook_id")
+
+    # Create notebook if needed
+    if not notebook_id:
+        notebook_id = await nlm.create_notebook(f"AI-Lab: {project_name}")
+        if notebook_id:
+            # Only update notebook_id, don't touch hash/status (indexer handles that)
+            entry = registry.get(project_name)
+            if entry:
+                registry._data["projects"][project_name]["notebook_id"] = notebook_id
+                registry._persist()
+            logger.info(f"Created notebook for {project_name}: {notebook_id}")
+        else:
+            _nlm_call_stats["total"] += 1
+            logger.warning(f"Failed to create notebook for {project_name}")
+            return
+
+    _nlm_call_stats["total"] += 1
+    result = await nlm.run_nlm_cycle(notebook_id, delta)
+
+    if result["success"]:
+        _nlm_call_stats["success"] += 1
+        # Store notes in Qdrant nlm_notes collection
+        for note in result["notes"]:
+            embedding = embed_text(f"{note['question']} {note['answer']}")
+            from core.indexer import upsert_points, generate_point_id
+            point_id = generate_point_id(f"nlm:{project_name}:{note['question'][:50]}", 0)
+            upsert_points([{
+                "id": point_id,
+                "vector": embedding,
+                "payload": {
+                    "text": note["answer"],
+                    "question": note["question"],
+                    "source": f"nlm:{project_name}",
+                    "project": project_name,
+                    "from_nlm": True,
+                    "type": note["type"],
+                    "chunk_index": 0,
+                },
+            }], COLLECTION_NLM_NOTES)
+
+        # Update nlm_source_count and mark validated
+        entry = registry.get(project_name)
+        if entry:
+            registry._data["projects"][project_name]["nlm_source_count"] = result["source_count"]
+        registry.mark_validated(project_name, coverage=1.0)
+        audit_log({"action": "nlm_validated", "project": project_name, "notes": len(result["notes"])})
+    else:
+        logger.warning(f"NLM cycle failed for {project_name}")
+        audit_log({"action": "nlm_failed", "project": project_name})
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: init services and start scan loop."""
+    global registry, _scan_task
+
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    registry = Registry(yaml_path=REGISTRY_YAML, redis_url=REDIS_URL)
+
+    # Ensure Qdrant collections exist
+    try:
+        ensure_collection(COLLECTION_KNOWLEDGE)
+        ensure_collection(COLLECTION_NLM_NOTES)
+    except Exception as e:
+        logger.warning(f"Qdrant init warning: {e}")
+
+    # Start background scan
+    _scan_task = asyncio.create_task(_scan_loop())
+    logger.info(f"Erudito v3 started. Scan interval: {SCAN_INTERVAL}s")
+
+    yield
+
+    # Cleanup
+    if _scan_task:
+        _scan_task.cancel()
+
+
+app = FastAPI(title="Erudito v3", version="3.0.0", lifespan=lifespan)
+
+
+# --- System Endpoints ---
 
 @app.get("/health")
 async def health():
-    """Health check."""
-    # Quick check: can we reach Qdrant and Ollama?
     qdrant_ok = False
-    ollama_ok = False
     try:
-        req = urllib.request.Request(f"{QDRANT_URL}/collections/{COLLECTION}")
-        resp = urllib.request.urlopen(req, timeout=3)
-        info = json.loads(resp.read())
-        qdrant_ok = info.get("result", {}).get("status") == "green"
-        points_count = info.get("result", {}).get("points_count", 0)
-    except Exception:
-        points_count = -1
-
-    try:
-        req = urllib.request.Request(f"{OLLAMA_URL}/api/tags")
-        resp = urllib.request.urlopen(req, timeout=3)
-        models = json.loads(resp.read())
-        ollama_ok = any(m["name"] == EMBED_MODEL for m in models.get("models", []))
+        from core.indexer import _qdrant_request
+        r = _qdrant_request("/collections", method="GET")
+        qdrant_ok = True
     except Exception:
         pass
 
-    return {
-        "status": "ok" if (qdrant_ok and ollama_ok) else "degraded",
-        "version": "2.0.0",
-        "agent": "erudito",
-        "qdrant": "ok" if qdrant_ok else "unreachable",
-        "ollama": "ok" if ollama_ok else "unreachable",
-        "collection": COLLECTION,
-        "points_count": points_count,
-        "embed_model": EMBED_MODEL,
-    }
-
-
-@app.post("/scan")
-async def trigger_scan():
-    """Trigger a full scan of all local sources."""
-    stats = await run_scan()
-    return {"status": "completed", "stats": stats}
-
-
-@app.post("/scan/{node}")
-async def trigger_scan_node(node: str):
-    """Trigger a scan for a specific node."""
-    sources = [s for s in SCAN_SOURCES if s.get("node") == node]
-    if not sources:
-        raise HTTPException(404, f"No sources for node: {node}")
-    stats = await run_scan(sources)
-    return {"status": "completed", "node": node, "stats": stats}
-
-
-@app.get("/status")
-async def status():
-    """Get scan status and last scan times."""
-    state = load_scan_state()
-    sources_info = []
-    for s in SCAN_SOURCES:
-        p = s["path"]
-        info = state.get(p, {})
-        sources_info.append({
-            "path": p,
-            "node": s.get("node"),
-            "type": s.get("type"),
-            "last_commit": info.get("last_commit", "never"),
-            "last_scan": info.get("last_scan", "never"),
-            "exists": os.path.isdir(p),
-        })
-    return {
-        "scan_sources": len(SCAN_SOURCES),
-        "sources": sources_info,
-        "collection": COLLECTION,
-    }
-
-
-@app.get("/audit")
-async def audit(since: str | None = None, limit: int = 50):
-    """Get recent audit log entries."""
-    entries = []
-    try:
-        with open(AUDIT_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if since and entry.get("timestamp", "") < since:
-                    continue
-                entries.append(entry)
-    except FileNotFoundError:
-        pass
-    return {"entries": entries[-limit:], "total": len(entries)}
-
-
-@app.delete("/staleness/cleanup")
-async def cleanup_stale(days: int = 30):
-    """Delete chunks not verified in N days."""
-    # Scroll all points, check last_verified, delete stale ones
-    cutoff = datetime.now(timezone.utc)
-    from datetime import timedelta
-    cutoff = cutoff - timedelta(days=days)
-    cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-
-    deleted = 0
-    offset = None
-    while True:
-        scroll_payload = {
-            "limit": 100,
-            "with_payload": ["last_verified"],
-        }
-        if offset is not None:
-            scroll_payload["offset"] = offset
-
+    redis_ok = False
+    if registry and registry._get_redis():
         try:
-            result = _qdrant_request(
-                f"/collections/{COLLECTION}/points/scroll",
-                data=scroll_payload,
-                method="POST",
-            )
+            registry._get_redis().ping()
+            redis_ok = True
         except Exception:
-            break
+            pass
 
-        points = result.get("result", {}).get("points", [])
-        next_offset = result.get("result", {}).get("next_page_offset")
-
-        stale_ids = []
-        for p in points:
-            lv = p.get("payload", {}).get("last_verified", "")
-            if lv and lv < cutoff_str:
-                stale_ids.append(p["id"])
-
-        if stale_ids:
-            try:
-                _qdrant_request(
-                    f"/collections/{COLLECTION}/points/delete",
-                    data={"points": stale_ids},
-                    method="POST",
-                )
-                deleted += len(stale_ids)
-            except Exception:
-                pass
-
-        if next_offset is None or not points:
-            break
-        offset = next_offset
-
-    audit_log({"action": "staleness_cleanup", "days": days, "deleted": deleted})
-    return {"status": "completed", "deleted": deleted, "cutoff": cutoff_str}
-
-
-# ---------------------------------------------------------------------------
-# v2: Search endpoint
-# ---------------------------------------------------------------------------
-
-
-@app.get("/search")
-async def search_knowledge(q: str, top_k: int = 5, min_score: float = 0.3):
-    """Semantic search over agent_knowledge collection."""
-    if not q or len(q.strip()) < 3:
-        raise HTTPException(status_code=400, detail="Query must be at least 3 characters")
-
-    try:
-        embedding = embed_text(q.strip())
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Embedding service unavailable: {e}")
-
-    try:
-        result = _qdrant_request(
-            f"/collections/{COLLECTION}/points/search",
-            data={
-                "vector": embedding,
-                "limit": top_k,
-                "score_threshold": min_score,
-                "with_payload": True,
-            },
-            method="POST",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Qdrant search failed: {e}")
-
-    hits = result.get("result", [])
     return {
-        "query": q,
-        "results": [
-            {
-                "score": round(hit.get("score", 0), 4),
-                "text": hit.get("payload", {}).get("text", ""),
-                "source": hit.get("payload", {}).get("source", ""),
-                "node": hit.get("payload", {}).get("node", ""),
-                "type": hit.get("payload", {}).get("type", ""),
-                # Enrichment fields (empty if not yet analyzed)
-                "summary": hit.get("payload", {}).get("summary", ""),
-                "concepts": hit.get("payload", {}).get("concepts", []),
-                "tags": hit.get("payload", {}).get("tags", []),
-                "relevance_score": hit.get("payload", {}).get("relevance_score"),
-                "doc_type": hit.get("payload", {}).get("doc_type", ""),
-            }
-            for hit in hits
-        ],
-        "total": len(hits),
+        "status": "ok" if qdrant_ok else "degraded",
+        "version": "3.0.0",
+        "qdrant": "up" if qdrant_ok else "down",
+        "redis": "up" if redis_ok else "down",
+        "projects": len(registry.list_all()) if registry else 0,
     }
-
-
-# ---------------------------------------------------------------------------
-# v2: Metrics endpoint
-# ---------------------------------------------------------------------------
 
 
 @app.get("/metrics")
-async def get_metrics():
-    """Return quality and coverage metrics for the knowledge base."""
-    try:
-        req = urllib.request.Request(f"{QDRANT_URL}/collections/{COLLECTION}")
-        resp = urllib.request.urlopen(req, timeout=5)
-        collection_info = json.loads(resp.read()).get("result", {})
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Qdrant unreachable: {e}")
+async def metrics():
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    summary = registry.summary()
 
-    total_points = collection_info.get("points_count", 0)
-    vectors_count = collection_info.get("vectors_count", 0)
-    segments_count = collection_info.get("segments_count")
+    # Freshness calculation
+    import statistics
+    freshness_values = []
+    for name in registry.list_all():
+        entry = registry.get(name)
+        if entry and entry.get("last_sync"):
+            try:
+                sync_time = datetime.fromisoformat(entry["last_sync"])
+                age_min = (datetime.now(timezone.utc) - sync_time).total_seconds() / 60
+                freshness_values.append(age_min)
+            except Exception:
+                pass
 
-    # Sample points to compute stats
-    try:
-        sample_result = _qdrant_request(
-            f"/collections/{COLLECTION}/points/scroll",
-            data={"limit": 200, "with_payload": True, "with_vectors": False},
-            method="POST",
-        )
-        points = sample_result.get("result", {}).get("points", [])
-    except Exception:
-        points = []
+    # Metadata compliance (tracked at file level during scans)
+    total_docs = _total_scanned_files
+    auto_enriched_count = _auto_enriched_files
 
-    enriched = sum(1 for p in points if p.get("payload", {}).get("relevance_score") is not None)
-    high_quality = sum(1 for p in points if (p.get("payload", {}).get("relevance_score") or 0) > 0.7)
-    has_concepts = sum(1 for p in points if p.get("payload", {}).get("concepts"))
-    has_summary = sum(1 for p in points if p.get("payload", {}).get("summary"))
+    nlm_health = round(
+        _nlm_call_stats["success"] / _nlm_call_stats["total"] * 100, 1
+    ) if _nlm_call_stats["total"] > 0 else 100.0
 
-    # Source distribution
-    sources = {}
-    for p in points:
-        src = p.get("payload", {}).get("source", "unknown")
-        parts = src.split("/")
-        # Extract meaningful directory name
-        repo = parts[0] if parts else "unknown"
-        for i, part in enumerate(parts):
-            if part in ("ai-lab", "desarrollos_openclaw") and i + 1 < len(parts):
-                repo = parts[i + 1]
-                break
-        sources[repo] = sources.get(repo, 0) + 1
-
-    sample_size = len(points)
+    query_hit = round(
+        _query_stats["high"] / _query_stats["total"] * 100, 1
+    ) if _query_stats["total"] > 0 else 0.0
 
     return {
-        "total_points": total_points,
-        "sample_size": sample_size,
-        "enrichment": {
-            "enriched_pct": round(enriched / sample_size * 100, 1) if sample_size else 0,
-            "high_quality_pct": round(high_quality / sample_size * 100, 1) if sample_size else 0,
-            "has_concepts_pct": round(has_concepts / sample_size * 100, 1) if sample_size else 0,
-            "has_summary_pct": round(has_summary / sample_size * 100, 1) if sample_size else 0,
-        },
-        "sources": dict(sorted(sources.items(), key=lambda x: -x[1])),
-        "collection": {
-            "vectors_count": vectors_count,
-            "segments_count": segments_count,
-        },
-        "feature_flags": {
-            "analyzer_enabled": ANALYZER_ENABLED,
-            "dedup_enabled": DEDUP_ENABLED,
-            "min_relevance": MIN_RELEVANCE,
-            "similarity_threshold": SIMILARITY_THRESHOLD,
-        },
+        "coverage": summary,
+        "freshness_avg_minutes": round(statistics.mean(freshness_values), 1) if freshness_values else 0,
+        "metadata_compliance_pct": round(
+            (1 - auto_enriched_count / total_docs) * 100, 1
+        ) if total_docs > 0 else 100.0,
+        "nlm_health_24h_pct": nlm_health,
+        "query_hit_rate_pct": query_hit,
+        "coherence_last_score": _coherence_cache.get("score"),
+        "coherence_last_run": _coherence_cache.get("timestamp"),
+        "last_scan": _last_scan_time,
     }
 
 
-# ---------------------------------------------------------------------------
-# v2: Reindex endpoint
-# ---------------------------------------------------------------------------
+@app.post("/metrics/coherence")
+async def update_coherence(data: dict):
+    """Endpoint for eval-agent to report coherence score."""
+    _coherence_cache["score"] = data.get("score")
+    _coherence_cache["timestamp"] = data.get("timestamp", _now_iso())
+    return {"status": "ok"}
 
 
-@app.post("/reindex")
-async def force_reindex():
-    """Force full re-index of all sources with LLM enrichment."""
-    audit_log({"action": "reindex_start"})
-
-    # Clear scan state to force full rescan
-    save_scan_state({})
-
-    stats = await run_scan()
-    audit_log({"action": "reindex_complete", "stats": {k: v for k, v in stats.items() if k != "errors"}})
-    return {"status": "completed", "stats": stats}
-
-
-# ---------------------------------------------------------------------------
-# Product Catalog routes
-# ---------------------------------------------------------------------------
-
-from catalog import (
-    list_projects, get_project, upsert_project,
-    delete_project, search_projects, count_projects,
-)
+@app.get("/audit")
+async def audit(limit: int = Query(default=50, ge=1, le=500)):
+    try:
+        with open(AUDIT_FILE, "r") as f:
+            lines = f.readlines()
+        entries = [json.loads(line) for line in lines[-limit:]]
+        entries.reverse()
+        return {"entries": entries}
+    except FileNotFoundError:
+        return {"entries": []}
 
 
-@app.get("/catalog")
-async def catalog_list():
-    """List all projects in the catalog."""
-    projects = list_projects()
-    return {"projects": projects, "count": len(projects)}
+# --- Registry Endpoints ---
+
+@app.get("/registry")
+async def list_registry():
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    projects = {}
+    for name in registry.list_all():
+        projects[name] = registry.get(name)
+    return {"projects": projects}
 
 
-@app.get("/catalog/search")
-async def catalog_search(q: str, top_k: int = 5):
-    """Search projects by natural language query."""
-    results = search_projects(q, top_k)
-    return {"query": q, "results": results}
+@app.get("/registry/{project}")
+async def get_registry_project(project: str):
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    entry = registry.get(project)
+    if not entry:
+        raise HTTPException(404, f"Project '{project}' not found")
+    return entry
 
 
-@app.get("/catalog/{name}")
-async def catalog_get(name: str):
-    """Get a project by name."""
-    project = get_project(name)
-    if not project:
-        raise HTTPException(404, f"Project not found: {name}")
-    return project
+@app.post("/registry")
+async def register_project(data: dict):
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    name = data.get("name")
+    path = data.get("path")
+    node = data.get("node", "hanzo")
+    repo = data.get("repo", "")
+
+    if not name or not path:
+        raise HTTPException(400, "name and path are required")
+
+    expanded = os.path.expanduser(path)
+    if not os.path.isdir(expanded):
+        raise HTTPException(400, f"Path does not exist: {path}")
+
+    from core.scanner import find_git_root
+    if not find_git_root(expanded):
+        raise HTTPException(400, f"Path is not a git repository: {path}")
+
+    try:
+        registry.register(name, path, node, repo)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return {"status": "registered", "project": name}
 
 
-@app.post("/catalog")
-async def catalog_upsert(entry: dict):
-    """Add or update a project in the catalog."""
-    if "name" not in entry:
-        raise HTTPException(400, "Missing 'name' field")
-    point_id = upsert_project(entry)
-    return {"status": "ok", "name": entry["name"], "point_id": point_id}
+# --- Scan Endpoints ---
+
+@app.post("/scan")
+async def scan_all():
+    asyncio.create_task(_run_scan_all())
+    return {"status": "scan_started", "projects": registry.list_all() if registry else []}
 
 
-@app.delete("/catalog/{name}")
-async def catalog_delete(name: str):
-    """Delete a project from the catalog."""
-    delete_project(name)
-    return {"status": "deleted", "name": name}
+@app.post("/scan/{project}")
+async def scan_project(project: str):
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    if not registry.get(project):
+        raise HTTPException(404, f"Project '{project}' not found")
+    asyncio.create_task(_scan_project(project))
+    return {"status": "scan_started", "project": project}
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# --- Search Endpoint ---
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8095)
+@app.get("/search")
+async def search_endpoint(
+    q: str = Query(..., min_length=1),
+    project: str | None = Query(default=None),
+    top_k: int = Query(default=5, ge=1, le=50),
+):
+    _query_stats["total"] += 1
+    result = await execute_query(
+        query=q,
+        project=project,
+        top_k=top_k,
+        nlm_client=nlm,
+        registry=registry,
+    )
+    if result["confidence"] == "high":
+        _query_stats["high"] += 1
+    return result
