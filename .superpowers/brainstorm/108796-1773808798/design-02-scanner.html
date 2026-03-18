@@ -1,0 +1,127 @@
+<h2>Seccion 2/6 — El Scanner (Delta Detection)</h2>
+<p class="subtitle">El componente que detecta que cambio y dispara el ciclo de sincronizacion.</p>
+
+<div class="section">
+  <h3>Que hace</h3>
+  <p>Recorre los proyectos del registry, compara el hash del ultimo commit procesado con el HEAD actual. Si hay diferencia, extrae los deltas (archivos .md que cambiaron) y los pasa al pipeline.</p>
+</div>
+
+<div class="section">
+  <h3>Flujo del scan</h3>
+  <div class="mockup">
+    <div class="mockup-header">scanner.py — ciclo principal</div>
+    <div class="mockup-body" style="font-size: 13px; padding: 20px; line-height: 2;">
+      <div style="display: flex; flex-direction: column; gap: 4px;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="background: #bd93f9; color: #282a36; padding: 2px 10px; border-radius: 12px; font-size: 11px;">1</span>
+          <span>registry.list_all() → obtener todos los proyectos</span>
+        </div>
+        <div style="color: #6272a4; padding-left: 36px;">↓ para cada proyecto</div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="background: #bd93f9; color: #282a36; padding: 2px 10px; border-radius: 12px; font-size: 11px;">2</span>
+          <span><code>git rev-parse HEAD</code> → hash actual</span>
+        </div>
+        <div style="color: #6272a4; padding-left: 36px;">↓ comparar con registry.last_hash</div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="background: #bd93f9; color: #282a36; padding: 2px 10px; border-radius: 12px; font-size: 11px;">3</span>
+          <span>Si son iguales → <span style="color: #50fa7b;">skip</span> (sin cambios)</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="background: #bd93f9; color: #282a36; padding: 2px 10px; border-radius: 12px; font-size: 11px;">4</span>
+          <span>Si son diferentes → <code>git diff --name-only last_hash..HEAD -- '*.md'</code></span>
+        </div>
+        <div style="color: #6272a4; padding-left: 36px;">↓ lista de archivos .md que cambiaron</div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="background: #bd93f9; color: #282a36; padding: 2px 10px; border-radius: 12px; font-size: 11px;">5</span>
+          <span>Leer contenido de cada archivo cambiado</span>
+        </div>
+        <div style="color: #6272a4; padding-left: 36px;">↓</div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="background: #bd93f9; color: #282a36; padding: 2px 10px; border-radius: 12px; font-size: 11px;">6</span>
+          <span>Validar metadata (frontmatter presente?)</span>
+        </div>
+        <div style="color: #6272a4; padding-left: 36px;">↓ si falta → auto-enrich + label</div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="background: #bd93f9; color: #282a36; padding: 2px 10px; border-radius: 12px; font-size: 11px;">7</span>
+          <span>Sanitizar via sanitizer-hanzo (<code>POST /sanitize</code>)</span>
+        </div>
+        <div style="color: #6272a4; padding-left: 36px;">↓ texto limpio</div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="background: #bd93f9; color: #282a36; padding: 2px 10px; border-radius: 12px; font-size: 11px;">8</span>
+          <span>Retornar <span style="color: #f1fa8c;">Delta</span> = {project, files[], new_hash}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>El objeto Delta</h3>
+  <div class="mockup">
+    <div class="mockup-header">Lo que el scanner produce</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 12px; line-height: 1.8;">
+<span style="color: #8be9fd;">Delta:</span>
+  <span style="color: #bd93f9;">project:</span> infra-mcp
+  <span style="color: #bd93f9;">old_hash:</span> a1b2c3d...
+  <span style="color: #bd93f9;">new_hash:</span> e4f5g6h...
+  <span style="color: #bd93f9;">files:</span>
+    - <span style="color: #bd93f9;">path:</span> README.md
+      <span style="color: #bd93f9;">action:</span> modified          <span style="color: #6272a4;"># modified | added | deleted</span>
+      <span style="color: #bd93f9;">content:</span> "..."             <span style="color: #6272a4;"># sanitizado, con metadata</span>
+      <span style="color: #bd93f9;">auto_enriched:</span> true       <span style="color: #6272a4;"># si se le agrego frontmatter</span>
+    - <span style="color: #bd93f9;">path:</span> docs/SOP.md
+      <span style="color: #bd93f9;">action:</span> added
+      <span style="color: #bd93f9;">content:</span> "..."
+      <span style="color: #bd93f9;">auto_enriched:</span> false
+  <span style="color: #bd93f9;">timestamp:</span> 2026-03-17T14:30:00Z
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>A donde va el Delta</h3>
+  <div class="mockup">
+    <div class="mockup-header">Consumidores del Delta</div>
+    <div class="mockup-body" style="text-align: center; padding: 24px; font-size: 13px;">
+      <div style="background: #bd93f9; color: #282a36; padding: 10px 20px; border-radius: 8px; display: inline-block; font-weight: bold; margin-bottom: 16px;">
+        Scanner produce Delta
+      </div>
+      <div style="display: flex; justify-content: center; gap: 40px; margin-top: 8px;">
+        <div style="display: flex; flex-direction: column; align-items: center; gap: 8px;">
+          <div style="color: #6272a4;">↓</div>
+          <div style="background: #50fa7b; color: #282a36; padding: 8px 16px; border-radius: 8px; font-weight: bold;">Indexer</div>
+          <div style="font-size: 11px; color: #6272a4;">Embed en Qdrant<br>(rapido, local)</div>
+        </div>
+        <div style="display: flex; flex-direction: column; align-items: center; gap: 8px;">
+          <div style="color: #6272a4;">↓</div>
+          <div style="background: #ff79c6; color: #282a36; padding: 8px 16px; border-radius: 8px; font-weight: bold;">NotebookLM</div>
+          <div style="font-size: 11px; color: #6272a4;">source_add + condensar<br>+ preguntas + notas</div>
+        </div>
+      </div>
+      <div style="margin-top: 20px; font-size: 11px; color: #f1fa8c;">
+        Ambos corren en paralelo. Indexer es rapido.<br>
+        NotebookLM es lento pero no bloquea al Indexer.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Frecuencia y trigger</h3>
+  <div style="font-size: 13px; background: #44475a; padding: 16px; border-radius: 8px; line-height: 1.8;">
+    <div><span style="color: #50fa7b;">&#10003;</span> <strong>Cron ligero:</strong> Cada 15 minutos corre el scan (solo git hash comparison, casi gratis)</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> <strong>No hay cambios:</strong> Log interno, no molesta a nadie</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> <strong>Hay cambios:</strong> Genera Delta, dispara Indexer + NotebookLM cycle</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> <strong>Manual:</strong> <code>POST /scan/{project}</code> fuerza un scan de un proyecto</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> <strong>Nodos remotos (Sariatu):</strong> git hash via SSH, misma logica</div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 16px; padding: 16px; background: #44475a; border-radius: 8px;">
+  <h3 style="color: #f1fa8c;">Decisiones de diseno</h3>
+  <ul style="line-height: 1.8; font-size: 13px;">
+    <li><strong>Solo .md por ahora:</strong> El diff filtra solo archivos .md. Podemos expandir despues (.yaml, .py) pero el 90% del valor esta en los docs.</li>
+    <li><strong>Sanitizar en el scanner, no en el indexer:</strong> El texto llega limpio a todos los consumidores. Un solo punto de sanitizacion.</li>
+    <li><strong>Auto-enrich aqui:</strong> Si falta frontmatter, el scanner lo agrega antes de pasar el Delta. Asi el Indexer y NotebookLM siempre reciben docs con metadata.</li>
+  </ul>
+</div>

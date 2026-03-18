@@ -1,0 +1,138 @@
+<h2>Seccion 5/6 — KPIs y Metricas</h2>
+<p class="subtitle">Como medimos que Erudito esta haciendo bien su trabajo. Esto es lo que eval-agent consume.</p>
+
+<div class="section">
+  <h3>Los dos KPIs core</h3>
+  <div class="split">
+    <div class="mockup">
+      <div class="mockup-header" style="background: #50fa7b; color: #282a36;">KPI 1: Cobertura</div>
+      <div class="mockup-body" style="padding: 20px; font-size: 13px; line-height: 1.8;">
+        <div style="color: #8be9fd; margin-bottom: 8px;">¿Cuantos proyectos estan cubiertos?</div>
+        <div style="background: #44475a; padding: 12px; border-radius: 6px; font-family: monospace; text-align: center; margin-bottom: 12px;">
+          <span style="font-size: 16px; color: #f1fa8c;">cobertura = validated / total_projects</span>
+        </div>
+        <div style="font-size: 12px;">
+          <div><span style="color: #50fa7b;">validated:</span> En Qdrant + NotebookLM confirmado</div>
+          <div><span style="color: #f1fa8c;">synced:</span> En Qdrant pero sin validar por NLM</div>
+          <div><span style="color: #ffb86c;">stale:</span> Tiene commits sin procesar</div>
+          <div><span style="color: #6272a4;">pending:</span> Registrado pero no indexado</div>
+        </div>
+        <div style="margin-top: 12px; padding: 8px; background: #282a36; border-radius: 4px; font-size: 11px;">
+          <strong>Ejemplo:</strong> 8 proyectos, 5 validated, 2 synced, 1 stale<br>
+          Cobertura = 5/8 = <span style="color: #50fa7b;">62.5%</span><br>
+          Cobertura parcial (synced+validated) = 7/8 = <span style="color: #f1fa8c;">87.5%</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="mockup">
+      <div class="mockup-header" style="background: #ff79c6; color: #282a36;">KPI 2: Coherencia</div>
+      <div class="mockup-body" style="padding: 20px; font-size: 13px; line-height: 1.8;">
+        <div style="color: #8be9fd; margin-bottom: 8px;">¿Erudito responde igual que NotebookLM?</div>
+        <div style="background: #44475a; padding: 12px; border-radius: 6px; font-family: monospace; text-align: center; margin-bottom: 12px;">
+          <span style="font-size: 16px; color: #f1fa8c;">coherencia = pass / total_probes</span>
+        </div>
+        <div style="font-size: 12px;">
+          <div>1. Tomar preguntas del ultimo rondin (de nlm_notes)</div>
+          <div>2. Hacerle las mismas preguntas a Erudito (solo Qdrant)</div>
+          <div>3. Comparar respuestas via LLM judge</div>
+          <div>4. Si la respuesta de Erudito es coherente → pass</div>
+          <div>5. Si diverge significativamente → fail</div>
+        </div>
+        <div style="margin-top: 12px; padding: 8px; background: #282a36; border-radius: 4px; font-size: 11px;">
+          <strong>Ejemplo:</strong> 10 preguntas, 8 coherentes, 2 divergen<br>
+          Coherencia = 8/10 = <span style="color: #50fa7b;">80%</span><br>
+          <span style="color: #6272a4;">Umbral aceptable: >= 70%</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>KPIs secundarios</h3>
+  <div style="display: flex; flex-direction: column; gap: 8px;">
+    <div style="background: #44475a; padding: 12px 16px; border-radius: 8px; display: flex; align-items: center; gap: 16px;">
+      <div style="background: #bd93f9; color: #282a36; padding: 4px 12px; border-radius: 12px; font-size: 11px; white-space: nowrap;">Freshness</div>
+      <div style="font-size: 13px;">Tiempo promedio entre commit y sync. Ideal: < 30 min (2 ciclos de 15 min).</div>
+    </div>
+    <div style="background: #44475a; padding: 12px 16px; border-radius: 8px; display: flex; align-items: center; gap: 16px;">
+      <div style="background: #bd93f9; color: #282a36; padding: 4px 12px; border-radius: 12px; font-size: 11px; white-space: nowrap;">Metadata</div>
+      <div style="font-size: 13px;">% de archivos con frontmatter completo (no auto-enriched). Mide compliance de los agentes.</div>
+    </div>
+    <div style="background: #44475a; padding: 12px 16px; border-radius: 8px; display: flex; align-items: center; gap: 16px;">
+      <div style="background: #bd93f9; color: #282a36; padding: 4px 12px; border-radius: 12px; font-size: 11px; white-space: nowrap;">NLM Health</div>
+      <div style="font-size: 13px;">% de llamadas exitosas a NotebookLM en las ultimas 24h. Si baja del 50% → auth probablemente caduco.</div>
+    </div>
+    <div style="background: #44475a; padding: 12px 16px; border-radius: 8px; display: flex; align-items: center; gap: 16px;">
+      <div style="background: #bd93f9; color: #282a36; padding: 4px 12px; border-radius: 12px; font-size: 11px; white-space: nowrap;">Query Hit</div>
+      <div style="font-size: 13px;">% de queries respondidas con confianza alta (score >= 0.75). Mide calidad del conocimiento indexado.</div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Como eval-agent los consume</h3>
+  <div class="mockup">
+    <div class="mockup-header">Integracion con eval-agent</div>
+    <div class="mockup-body" style="font-size: 13px; padding: 20px; line-height: 1.8;">
+      <div style="display: flex; flex-direction: column; gap: 12px;">
+        <div style="display: flex; gap: 12px; align-items: flex-start;">
+          <div style="background: #50fa7b; color: #282a36; padding: 4px 10px; border-radius: 4px; font-size: 11px; white-space: nowrap;">metric</div>
+          <div>
+            <code>GET /health</code> → status, collections, NLM health<br>
+            <code>GET /metrics</code> → cobertura, freshness, metadata compliance
+          </div>
+        </div>
+        <div style="display: flex; gap: 12px; align-items: flex-start;">
+          <div style="background: #ff79c6; color: #282a36; padding: 4px 10px; border-radius: 4px; font-size: 11px; white-space: nowrap;">probe</div>
+          <div>
+            <code>GET /search?q=...</code> → eval-agent hace las preguntas que estan en nlm_notes<br>
+            y compara via LLM judge si la respuesta de Erudito es coherente
+          </div>
+        </div>
+      </div>
+      <div style="margin-top: 16px; padding: 10px; background: #282a36; border-radius: 6px; font-size: 11px;">
+        <strong>Archivo KPI:</strong> <code>~/ai-lab/agent-eval/kpis/erudito.yaml</code><br>
+        Se actualiza como parte de la implementacion de Erudito v3.<br>
+        Las preguntas del probe se rotan: cada rondin genera nuevas en nlm_notes,<br>
+        eval-agent siempre usa las mas recientes.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Endpoint /metrics (lo que Erudito expone)</h3>
+  <div class="mockup">
+    <div class="mockup-header">GET /metrics — respuesta</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 12px; line-height: 1.8; padding: 16px;">
+<span style="color: #8be9fd;">{</span>
+  <span style="color: #bd93f9;">"coverage"</span>: <span style="color: #8be9fd;">{</span>
+    <span style="color: #bd93f9;">"total_projects"</span>: 8,
+    <span style="color: #bd93f9;">"validated"</span>: 5,
+    <span style="color: #bd93f9;">"synced"</span>: 2,
+    <span style="color: #bd93f9;">"stale"</span>: 1,
+    <span style="color: #bd93f9;">"pending"</span>: 0,
+    <span style="color: #bd93f9;">"coverage_pct"</span>: <span style="color: #f1fa8c;">62.5</span>,
+    <span style="color: #bd93f9;">"coverage_partial_pct"</span>: <span style="color: #f1fa8c;">87.5</span>
+  <span style="color: #8be9fd;">}</span>,
+  <span style="color: #bd93f9;">"freshness_avg_minutes"</span>: <span style="color: #f1fa8c;">22</span>,
+  <span style="color: #bd93f9;">"metadata_compliance_pct"</span>: <span style="color: #f1fa8c;">78.0</span>,
+  <span style="color: #bd93f9;">"nlm_health_24h_pct"</span>: <span style="color: #f1fa8c;">95.0</span>,
+  <span style="color: #bd93f9;">"query_hit_rate_pct"</span>: <span style="color: #f1fa8c;">82.0</span>,
+  <span style="color: #bd93f9;">"last_scan"</span>: <span style="color: #f1fa8c;">"2026-03-18T02:15:00Z"</span>
+<span style="color: #8be9fd;">}</span>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 16px; padding: 16px; background: #44475a; border-radius: 8px;">
+  <h3 style="color: #f1fa8c;">Decisiones de diseno</h3>
+  <ul style="line-height: 1.8; font-size: 13px;">
+    <li><strong>Cobertura dual:</strong> Reportamos coverage (solo validated) y coverage_partial (synced+validated). Asi sabes cuanto funciona vs cuanto esta totalmente validado.</li>
+    <li><strong>Coherencia la ejecuta eval-agent, no Erudito:</strong> Erudito expone los datos (nlm_notes + search). Eval-agent hace la comparacion y el LLM judge. Separacion de responsabilidades.</li>
+    <li><strong>NLM Health como early warning:</strong> Si baja del 50% es casi seguro que la auth caduco. No emite alerta al mesh (por ahora) pero lo loggea para que tu lo veas en /metrics.</li>
+    <li><strong>Probes rotativos:</strong> Las preguntas que eval-agent usa para medir coherencia se rotan automaticamente con cada rondin. No son estaticas — si el proyecto cambia, las preguntas cambian.</li>
+  </ul>
+</div>

@@ -7,17 +7,17 @@ services:
       - "127.0.0.1:8095:8095"
     environment:
       - QDRANT_URL=http://qdrant:6333
-      - OLLAMA_URL=http://host.docker.internal:11434
+      - OLLAMA_URL=http://172.17.0.1:11434
       - LITELLM_URL=http://litellm-proxy-local:4000/v1
-      - REDIS_URL=redis://litellm-redis-local:6379
+      - REDIS_URL=redis://:75bdc57ba2966fc5c9f1bb07ddeef02e5a2b6b13@litellm-redis-local:6379
       - SANITIZER_URL=http://sanitizer-hanzo:8086
       - ERUDITO_CONFIDENCE_THRESHOLD=0.75
       - SCAN_INTERVAL_MINUTES=15
       - DATA_DIR=/app/data
     volumes:
       - ./data:/app/data
-      - ~/ai-lab:/mnt/ai-lab:ro
-      - ~/desarrollos_openclaw:/mnt/dev:ro
+      - /home/r0calex/ai-lab:/home/r0calex/ai-lab:ro
+      - /home/r0calex/desarrollos_openclaw:/home/r0calex/desarrollos_openclaw:ro
     networks:
       - litellm-local_litellm-network
     restart: unless-stopped

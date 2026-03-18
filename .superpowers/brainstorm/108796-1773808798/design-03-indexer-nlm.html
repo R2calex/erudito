@@ -1,0 +1,158 @@
+<h2>Seccion 3/6 — Indexer + Ciclo NotebookLM</h2>
+<p class="subtitle">Los dos consumidores del Delta: uno rapido y local, otro inteligente y externo.</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header" style="background: #50fa7b; color: #282a36;">Indexer (core/indexer.py)</div>
+    <div class="mockup-body" style="font-size: 12px; line-height: 1.8; padding: 16px;">
+      <div style="color: #8be9fd; margin-bottom: 8px;">Rapido, local, siempre disponible</div>
+      <div style="display: flex; flex-direction: column; gap: 6px;">
+        <div><span style="color: #bd93f9;">1.</span> Recibe Delta del scanner</div>
+        <div><span style="color: #bd93f9;">2.</span> Chunk cada archivo (800 chars, 150 overlap)</div>
+        <div><span style="color: #bd93f9;">3.</span> Embed via Ollama (nomic-embed-text)</div>
+        <div><span style="color: #bd93f9;">4.</span> Upsert en Qdrant (collection: agent_knowledge)</div>
+        <div><span style="color: #bd93f9;">5.</span> Si action=deleted → remove del collection</div>
+        <div><span style="color: #bd93f9;">6.</span> registry.update_sync(project, new_hash)</div>
+      </div>
+      <div style="margin-top: 12px; padding: 8px; background: #44475a; border-radius: 6px; font-size: 11px;">
+        <strong>Tiempo estimado:</strong> ~2-5 segundos por archivo<br>
+        <strong>Dependencias:</strong> Qdrant + Ollama (ambos locales)<br>
+        <strong>Si falla:</strong> Retry 3x, luego log error. No bloquea NLM.
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header" style="background: #ff79c6; color: #282a36;">Ciclo NotebookLM (integrations/notebooklm.py)</div>
+    <div class="mockup-body" style="font-size: 12px; line-height: 1.8; padding: 16px;">
+      <div style="color: #8be9fd; margin-bottom: 8px;">Inteligente, externo, best-effort</div>
+      <div style="display: flex; flex-direction: column; gap: 6px;">
+        <div><span style="color: #bd93f9;">1.</span> Recibe Delta del scanner</div>
+        <div><span style="color: #bd93f9;">2.</span> source_add cada archivo al notebook</div>
+        <div><span style="color: #bd93f9;">3.</span> Esperar procesamiento (~15-30s)</div>
+        <div><span style="color: #bd93f9;">4.</span> notebook_query: "condensa las fuentes"</div>
+        <div><span style="color: #bd93f9;">5.</span> Generar 5-10 preguntas pertinentes</div>
+        <div><span style="color: #bd93f9;">6.</span> notebook_query con cada pregunta</div>
+        <div><span style="color: #bd93f9;">7.</span> note() — guardar respuestas como notas</div>
+        <div><span style="color: #bd93f9;">8.</span> Validar notas guardadas</div>
+        <div><span style="color: #bd93f9;">9.</span> Almacenar en Qdrant (collection: nlm_notes)</div>
+        <div><span style="color: #bd93f9;">10.</span> registry.mark_validated(project)</div>
+      </div>
+      <div style="margin-top: 12px; padding: 8px; background: #44475a; border-radius: 6px; font-size: 11px;">
+        <strong>Tiempo estimado:</strong> ~2-5 minutos por proyecto<br>
+        <strong>Dependencias:</strong> NotebookLM MCP (via LiteLLM)<br>
+        <strong>Si falla:</strong> Log, status queda "synced" (no "validated"). Reintenta en proximo rondin.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Flujo completo post-Delta</h3>
+  <div class="mockup">
+    <div class="mockup-header">Ambos pipelines en paralelo</div>
+    <div class="mockup-body" style="text-align: center; padding: 24px; font-size: 13px;">
+      <div style="background: #bd93f9; color: #282a36; padding: 10px 20px; border-radius: 8px; display: inline-block; font-weight: bold;">
+        Delta detectado
+      </div>
+      <div style="display: flex; justify-content: center; gap: 60px; margin-top: 16px;">
+        <!-- Left pipeline -->
+        <div style="display: flex; flex-direction: column; align-items: center; gap: 8px;">
+          <div style="color: #6272a4;">↓ async</div>
+          <div style="background: #50fa7b; color: #282a36; padding: 6px 14px; border-radius: 6px; font-size: 12px;">Chunk + Embed</div>
+          <div style="color: #6272a4;">↓</div>
+          <div style="background: #50fa7b; color: #282a36; padding: 6px 14px; border-radius: 6px; font-size: 12px;">Upsert Qdrant</div>
+          <div style="color: #6272a4;">↓</div>
+          <div style="background: #50fa7b; color: #282a36; padding: 6px 14px; border-radius: 6px; font-size: 12px;">status = synced</div>
+          <div style="color: #6272a4; font-size: 11px; margin-top: 4px;">~5 segundos</div>
+        </div>
+        <!-- Right pipeline -->
+        <div style="display: flex; flex-direction: column; align-items: center; gap: 8px;">
+          <div style="color: #6272a4;">↓ async</div>
+          <div style="background: #ff79c6; color: #282a36; padding: 6px 14px; border-radius: 6px; font-size: 12px;">source_add</div>
+          <div style="color: #6272a4;">↓ wait 15-30s</div>
+          <div style="background: #ff79c6; color: #282a36; padding: 6px 14px; border-radius: 6px; font-size: 12px;">Condensar</div>
+          <div style="color: #6272a4;">↓</div>
+          <div style="background: #ff79c6; color: #282a36; padding: 6px 14px; border-radius: 6px; font-size: 12px;">Preguntas (5-10)</div>
+          <div style="color: #6272a4;">↓</div>
+          <div style="background: #ff79c6; color: #282a36; padding: 6px 14px; border-radius: 6px; font-size: 12px;">Crear notas</div>
+          <div style="color: #6272a4;">↓</div>
+          <div style="background: #ff79c6; color: #282a36; padding: 6px 14px; border-radius: 6px; font-size: 12px;">Guardar en Qdrant</div>
+          <div style="color: #6272a4;">↓</div>
+          <div style="background: #ff79c6; color: #282a36; padding: 6px 14px; border-radius: 6px; font-size: 12px;">status = validated</div>
+          <div style="color: #6272a4; font-size: 11px; margin-top: 4px;">~2-5 minutos</div>
+        </div>
+      </div>
+      <div style="margin-top: 20px; padding: 10px; background: #44475a; border-radius: 6px; font-size: 11px; color: #f1fa8c;">
+        El Indexer termina primero → Erudito ya puede responder preguntas desde Qdrant.<br>
+        NotebookLM termina despues → sube el status a "validated" y enriquece el conocimiento.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Las preguntas del rondin</h3>
+  <p class="subtitle">Que le pregunta Erudito a NotebookLM sobre cada proyecto</p>
+  <div style="font-size: 13px; background: #44475a; padding: 16px; border-radius: 8px; line-height: 2;">
+    <div style="color: #8be9fd; margin-bottom: 8px;">Preguntas fijas (siempre):</div>
+    <div style="padding-left: 12px;">
+      <div>1. Que cambios ha habido desde la ultima sesion?</div>
+      <div>2. Hubo algun cambio de diseno respecto al plan original?</div>
+      <div>3. Que recursos nuevos se han dado de alta para este proyecto?</div>
+      <div>4. En que nodo del AI-Lab esta corriendo este proyecto?</div>
+      <div>5. Cual es el estado actual del proyecto segun la documentacion?</div>
+    </div>
+    <div style="color: #8be9fd; margin-top: 12px; margin-bottom: 8px;">Preguntas dinamicas (generadas por LLM local):</div>
+    <div style="padding-left: 12px;">
+      <div>6-10. Basadas en el contenido del Delta (que cambio especificamente)</div>
+      <div style="color: #6272a4; font-size: 11px; margin-top: 4px;">
+        Ejemplo: si el Delta incluye un cambio en el SPEC, una pregunta seria:<br>
+        "El SPEC menciona un nuevo endpoint /api/v2/query. Que funcionalidad agrega?"
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Donde se guardan las notas</h3>
+  <div class="mockup">
+    <div class="mockup-header">Doble almacenamiento</div>
+    <div class="mockup-body" style="font-size: 13px; padding: 20px;">
+      <div style="display: flex; justify-content: center; gap: 40px;">
+        <div style="text-align: center;">
+          <div style="background: #ff79c6; color: #282a36; padding: 8px 16px; border-radius: 8px; font-weight: bold; margin-bottom: 8px;">NotebookLM</div>
+          <div style="font-size: 11px; color: #6272a4;">
+            note() → notas dentro del notebook<br>
+            Accesibles via notebook_query<br>
+            NotebookLM las usa como contexto<br>
+            para futuras respuestas
+          </div>
+        </div>
+        <div style="text-align: center;">
+          <div style="background: #50fa7b; color: #282a36; padding: 8px 16px; border-radius: 8px; font-weight: bold; margin-bottom: 8px;">Qdrant</div>
+          <div style="font-size: 11px; color: #6272a4;">
+            Collection: nlm_notes<br>
+            Separada de agent_knowledge<br>
+            Buscable por Erudito directamente<br>
+            Sirve como ground truth para KPIs
+          </div>
+        </div>
+      </div>
+      <div style="margin-top: 16px; text-align: center; font-size: 11px; color: #f1fa8c;">
+        Las notas en Qdrant son el "examen" para el KPI de coherencia.<br>
+        Si Erudito responde algo muy diferente a lo que esta en nlm_notes → esta desviando.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 16px; padding: 16px; background: #44475a; border-radius: 8px;">
+  <h3 style="color: #f1fa8c;">Decisiones de diseno</h3>
+  <ul style="line-height: 1.8; font-size: 13px;">
+    <li><strong>Dos collections en Qdrant:</strong> <code>agent_knowledge</code> (embeddings crudos de docs) y <code>nlm_notes</code> (respuestas validadas por NotebookLM). Separadas porque tienen distinto nivel de confianza.</li>
+    <li><strong>NotebookLM no bloquea al Indexer:</strong> Si NLM falla, Erudito sigue respondiendo desde Qdrant. El proyecto queda en "synced" en vez de "validated" — funcional pero no validado.</li>
+    <li><strong>5 fijas + 5 dinamicas:</strong> Las preguntas fijas dan consistencia entre proyectos (comparables). Las dinamicas capturan lo especifico del cambio.</li>
+    <li><strong>Notas como ground truth:</strong> Las respuestas de NotebookLM guardadas en nlm_notes son el baseline contra el que eval-agent mide si Erudito esta respondiendo coherentemente.</li>
+  </ul>
+</div>

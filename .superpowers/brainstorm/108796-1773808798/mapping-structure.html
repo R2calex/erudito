@@ -1,0 +1,93 @@
+<h2>Estructura del Mapa Central de Erudito</h2>
+<p class="subtitle">El registro triple: Proyecto + Notebook + Repo</p>
+
+<div class="section">
+  <h3>El registro por proyecto (1:1, no negociable)</h3>
+  <div class="mockup">
+    <div class="mockup-header">project_registry entry</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 13px; line-height: 1.6;">
+      <div style="color: #8be9fd;">infra-mcp:</div>
+      <div style="padding-left: 20px;">
+        <div><span style="color: #bd93f9;">path:</span> ~/ai-lab/infra-mcp</div>
+        <div><span style="color: #bd93f9;">notebook_id:</span> abc-123-def</div>
+        <div><span style="color: #bd93f9;">repo:</span> r0calex/infra-mcp</div>
+        <div><span style="color: #bd93f9;">node:</span> hanzo</div>
+        <div><span style="color: #bd93f9;">last_sync:</span> 2026-03-17T14:00:00Z</div>
+        <div><span style="color: #bd93f9;">last_hash:</span> e2c8bfc...</div>
+        <div><span style="color: #bd93f9;">status:</span> <span style="color: #50fa7b;">validated</span></div>
+        <div><span style="color: #bd93f9;">coverage:</span> 85%</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Opcion B: El notebook "mesh-overview"</h3>
+  <p class="subtitle">Complejidad adicional vs valor</p>
+</div>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Simple (solo 1:1)</div>
+    <div class="mockup-body" style="font-size: 13px; text-align: center; padding: 20px;">
+      <div style="display: flex; flex-direction: column; gap: 8px; align-items: center;">
+        <div style="background: #44475a; padding: 8px 16px; border-radius: 6px; width: 80%;">infra-mcp <span style="color: #6272a4;">-></span> notebook-A</div>
+        <div style="background: #44475a; padding: 8px 16px; border-radius: 6px; width: 80%;">devops-agent <span style="color: #6272a4;">-></span> notebook-B</div>
+        <div style="background: #44475a; padding: 8px 16px; border-radius: 6px; width: 80%;">erudito <span style="color: #6272a4;">-></span> notebook-C</div>
+        <div style="background: #44475a; padding: 8px 16px; border-radius: 6px; width: 80%;">mesh-monitor <span style="color: #6272a4;">-></span> notebook-D</div>
+      </div>
+      <div style="margin-top: 16px; color: #50fa7b; font-size: 12px;">
+        Cross-project = solo Erudito (Qdrant)
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">Con mesh-overview</div>
+    <div class="mockup-body" style="font-size: 13px; text-align: center; padding: 20px;">
+      <div style="display: flex; flex-direction: column; gap: 8px; align-items: center;">
+        <div style="background: #44475a; padding: 8px 16px; border-radius: 6px; width: 80%;">infra-mcp <span style="color: #6272a4;">-></span> notebook-A</div>
+        <div style="background: #44475a; padding: 8px 16px; border-radius: 6px; width: 80%;">devops-agent <span style="color: #6272a4;">-></span> notebook-B</div>
+        <div style="background: #44475a; padding: 8px 16px; border-radius: 6px; width: 80%;">erudito <span style="color: #6272a4;">-></span> notebook-C</div>
+        <div style="background: #44475a; padding: 8px 16px; border-radius: 6px; width: 80%;">mesh-monitor <span style="color: #6272a4;">-></span> notebook-D</div>
+        <div style="background: #ff79c6; color: #282a36; padding: 8px 16px; border-radius: 6px; width: 80%; margin-top: 8px; font-weight: bold;">
+          mesh-overview <span style="color: #282a36;">-></span> notebook-MASTER
+        </div>
+      </div>
+      <div style="margin-top: 12px; color: #f1fa8c; font-size: 11px;">
+        Sync extra: README de cada proyecto<br>
+        se copia a notebook-MASTER como fuente.<br>
+        Cross-project = Erudito + NotebookLM
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>La complejidad real del mesh-overview</h3>
+  <div class="pros-cons">
+    <div class="pros">
+      <h4>Es manejable porque...</h4>
+      <ul>
+        <li>Solo sincroniza 1 archivo por proyecto (README o SPEC principal)</li>
+        <li>No necesita logica nueva — mismo source_add que ya usamos</li>
+        <li>Erudito ya recorre todos los proyectos en el rondin — agregar una fuente al master es 1 llamada extra</li>
+        <li>El mapeo es simple: mesh-overview es un proyecto "virtual" con notebook_id fijo</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>El costo es...</h4>
+      <ul>
+        <li>1 source_add extra por proyecto que cambie (durante el rondin)</li>
+        <li>NotebookLM reprocesa el notebook master cada vez</li>
+        <li>Si hay 15 proyectos = 15 fuentes en el master notebook</li>
+        <li>Posible rate limit si muchos proyectos cambian a la vez</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px; padding: 16px; background: #44475a; border-radius: 8px;">
+  <h3 style="color: #50fa7b;">Mi recomendacion</h3>
+  <p>Empezar con el 1:1 (no negociable). El mesh-overview se agrega despues como un proyecto "virtual" mas en el registry — es literalmente una entrada mas en el mapa, no logica nueva. Erudito no distingue entre un proyecto real y el mesh-overview, ambos tienen notebook_id y se sincronizan igual.</p>
+</div>

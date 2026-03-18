@@ -1,0 +1,222 @@
+<h2>Seccion 6/6 — API, Deploy y Estructura Final</h2>
+<p class="subtitle">Como se despliega, que endpoints expone, y la estructura de archivos completa.</p>
+
+<div class="section">
+  <h3>Estructura de archivos</h3>
+  <div class="mockup">
+    <div class="mockup-header">~/ai-lab/erudito/ (Erudito v3)</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 12px; line-height: 1.9; padding: 16px;">
+<span style="color: #8be9fd;">erudito/</span>
+├── <span style="color: #50fa7b;">main.py</span>              <span style="color: #6272a4;"># FastAPI app, lifespan, endpoints</span>
+├── <span style="color: #8be9fd;">core/</span>
+│   ├── registry.py        <span style="color: #6272a4;"># Mapa triple (YAML + Redis dual-write)</span>
+│   ├── scanner.py         <span style="color: #6272a4;"># Delta detection (git hash diff)</span>
+│   ├── indexer.py         <span style="color: #6272a4;"># Qdrant embedding pipeline</span>
+│   ├── query.py           <span style="color: #6272a4;"># Search + confidence routing (umbral 0.75)</span>
+│   └── enricher.py        <span style="color: #6272a4;"># Auto-enrich metadata faltante</span>
+├── <span style="color: #ff79c6;">integrations/</span>
+│   ├── notebooklm.py      <span style="color: #6272a4;"># Cliente NotebookLM MCP (via LiteLLM)</span>
+│   ├── sanitizer.py       <span style="color: #6272a4;"># Cliente HTTP → sanitizer-hanzo</span>
+│   └── github.py          <span style="color: #6272a4;"># Repo sync (futuro, placeholder)</span>
+├── <span style="color: #f1fa8c;">data/</span>
+│   ├── registry.yaml      <span style="color: #6272a4;"># Estado del mapa (+ backup en Redis)</span>
+│   └── audit.jsonl        <span style="color: #6272a4;"># Log de operaciones</span>
+├── <span style="color: #f1fa8c;">tests/</span>
+│   ├── test_registry.py
+│   ├── test_scanner.py
+│   ├── test_indexer.py
+│   ├── test_query.py
+│   ├── test_notebooklm.py
+│   └── test_sanitizer.py
+├── Dockerfile
+├── docker-compose.yaml
+└── requirements.txt
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>API Endpoints</h3>
+  <div style="display: flex; flex-direction: column; gap: 6px; font-size: 13px;">
+
+    <div style="color: #8be9fd; font-weight: bold; margin-top: 8px;">Sistema</div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #50fa7b; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">GET</span>
+      <code>/health</code>
+      <span style="color: #6272a4; font-size: 12px;">— Status, Qdrant, Ollama, NLM, Redis</span>
+    </div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #50fa7b; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">GET</span>
+      <code>/metrics</code>
+      <span style="color: #6272a4; font-size: 12px;">— KPIs: cobertura, coherencia, freshness, etc.</span>
+    </div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #50fa7b; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">GET</span>
+      <code>/audit</code>
+      <span style="color: #6272a4; font-size: 12px;">— Log de operaciones recientes</span>
+    </div>
+
+    <div style="color: #8be9fd; font-weight: bold; margin-top: 12px;">Registry</div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #50fa7b; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">GET</span>
+      <code>/registry</code>
+      <span style="color: #6272a4; font-size: 12px;">— Listar todos los proyectos y su estado</span>
+    </div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #50fa7b; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">GET</span>
+      <code>/registry/{project}</code>
+      <span style="color: #6272a4; font-size: 12px;">— Detalle de un proyecto</span>
+    </div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #f1fa8c; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">POST</span>
+      <code>/registry</code>
+      <span style="color: #6272a4; font-size: 12px;">— Registrar nuevo proyecto (name, path, node, repo)</span>
+    </div>
+
+    <div style="color: #8be9fd; font-weight: bold; margin-top: 12px;">Scanning</div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #f1fa8c; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">POST</span>
+      <code>/scan</code>
+      <span style="color: #6272a4; font-size: 12px;">— Forzar scan de todos los proyectos</span>
+    </div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #f1fa8c; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">POST</span>
+      <code>/scan/{project}</code>
+      <span style="color: #6272a4; font-size: 12px;">— Forzar scan de un proyecto especifico</span>
+    </div>
+
+    <div style="color: #8be9fd; font-weight: bold; margin-top: 12px;">Consultas</div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #50fa7b; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">GET</span>
+      <code>/search?q=...&project=...&top_k=5</code>
+      <span style="color: #6272a4; font-size: 12px;">— Busqueda semantica con confidence routing</span>
+    </div>
+    <div style="background: #44475a; padding: 10px 16px; border-radius: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="background: #50fa7b; color: #282a36; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;">GET</span>
+      <code>/search?q=...&top_k=10</code>
+      <span style="color: #6272a4; font-size: 12px;">— Busqueda cross-project (sin filtro, solo Qdrant)</span>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Deploy — Docker Compose</h3>
+  <div class="mockup">
+    <div class="mockup-header">docker-compose.yaml (Erudito + Sanitizer)</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 11px; line-height: 1.8; padding: 16px;">
+<span style="color: #8be9fd;">services:</span>
+
+  <span style="color: #50fa7b;">erudito:</span>
+    <span style="color: #bd93f9;">build:</span> .
+    <span style="color: #bd93f9;">container_name:</span> erudito
+    <span style="color: #bd93f9;">ports:</span>
+      - <span style="color: #f1fa8c;">"100.119.223.20:8095:8095"</span>    <span style="color: #6272a4;"># Tailscale mesh</span>
+      - <span style="color: #f1fa8c;">"127.0.0.1:8095:8095"</span>         <span style="color: #6272a4;"># localhost</span>
+    <span style="color: #bd93f9;">environment:</span>
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - LITELLM_URL=http://litellm-proxy-local:4000/v1
+      - REDIS_URL=redis://litellm-redis-local:6379
+      - SANITIZER_URL=http://sanitizer-hanzo:8086
+      - CONFIDENCE_THRESHOLD=0.75
+      - SCAN_INTERVAL_MINUTES=15
+    <span style="color: #bd93f9;">volumes:</span>
+      - ./data:/app/data                 <span style="color: #6272a4;"># registry.yaml, audit</span>
+      - ~/ai-lab:/mnt/ai-lab:ro          <span style="color: #6272a4;"># acceso a repos (read-only)</span>
+      - ~/desarrollos_openclaw:/mnt/dev:ro
+    <span style="color: #bd93f9;">networks:</span>
+      - litellm-local_litellm-network
+    <span style="color: #bd93f9;">restart:</span> unless-stopped
+    <span style="color: #bd93f9;">healthcheck:</span>
+      <span style="color: #bd93f9;">test:</span> ["CMD", "curl", "-f", "http://localhost:8095/health"]
+      <span style="color: #bd93f9;">interval:</span> 30s
+
+  <span style="color: #ff79c6;">sanitizer-hanzo:</span>
+    <span style="color: #bd93f9;">image:</span> kubo-sanitizer:local         <span style="color: #6272a4;"># misma imagen que Kubo</span>
+    <span style="color: #bd93f9;">container_name:</span> sanitizer-hanzo
+    <span style="color: #bd93f9;">ports:</span>
+      - <span style="color: #f1fa8c;">"100.119.223.20:8086:8086"</span>    <span style="color: #6272a4;"># Tailscale (Sariatu lo usa)</span>
+      - <span style="color: #f1fa8c;">"127.0.0.1:8086:8086"</span>
+    <span style="color: #bd93f9;">networks:</span>
+      - litellm-local_litellm-network
+    <span style="color: #bd93f9;">restart:</span> unless-stopped
+    <span style="color: #bd93f9;">healthcheck:</span>
+      <span style="color: #bd93f9;">test:</span> ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      <span style="color: #bd93f9;">interval:</span> 30s
+
+<span style="color: #8be9fd;">networks:</span>
+  <span style="color: #bd93f9;">litellm-local_litellm-network:</span>
+    <span style="color: #bd93f9;">external:</span> true
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Diagrama de servicios en Hanzo</h3>
+  <div class="mockup">
+    <div class="mockup-header">Topologia post-deploy</div>
+    <div class="mockup-body" style="text-align: center; padding: 24px; font-size: 12px;">
+      <div style="display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; margin-bottom: 20px;">
+        <div style="background: #50fa7b; color: #282a36; padding: 8px 14px; border-radius: 8px; font-weight: bold;">
+          Erudito<br><span style="font-size: 10px; font-weight: normal;">:8095</span>
+        </div>
+        <div style="background: #ff79c6; color: #282a36; padding: 8px 14px; border-radius: 8px; font-weight: bold;">
+          Sanitizer<br><span style="font-size: 10px; font-weight: normal;">:8086</span>
+        </div>
+      </div>
+      <div style="color: #6272a4; margin-bottom: 12px;">↕ litellm-network ↕</div>
+      <div style="display: flex; justify-content: center; gap: 16px; flex-wrap: wrap;">
+        <div style="background: #44475a; padding: 8px 14px; border-radius: 8px;">
+          Qdrant<br><span style="font-size: 10px; color: #6272a4;">:6333</span>
+        </div>
+        <div style="background: #44475a; padding: 8px 14px; border-radius: 8px;">
+          Redis<br><span style="font-size: 10px; color: #6272a4;">:6379</span>
+        </div>
+        <div style="background: #44475a; padding: 8px 14px; border-radius: 8px;">
+          Ollama<br><span style="font-size: 10px; color: #6272a4;">:11434</span>
+        </div>
+        <div style="background: #44475a; padding: 8px 14px; border-radius: 8px;">
+          LiteLLM<br><span style="font-size: 10px; color: #6272a4;">:4000</span>
+        </div>
+        <div style="background: #44475a; padding: 8px 14px; border-radius: 8px;">
+          NLM MCP<br><span style="font-size: 10px; color: #6272a4;">:8765</span>
+        </div>
+      </div>
+      <div style="margin-top: 16px; color: #6272a4; font-size: 11px;">
+        Sariatu accede a Erudito y Sanitizer via Tailscale (100.119.223.20)
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Migracion desde v2</h3>
+  <div style="font-size: 13px; line-height: 1.8;">
+    <div style="background: #44475a; padding: 12px 16px; border-radius: 8px; margin-bottom: 8px;">
+      <span style="color: #50fa7b;">1.</span> <strong>Qdrant collection agent_knowledge:</strong> Se mantiene. Los embeddings existentes siguen siendo validos. Se agrega collection nlm_notes.
+    </div>
+    <div style="background: #44475a; padding: 12px 16px; border-radius: 8px; margin-bottom: 8px;">
+      <span style="color: #50fa7b;">2.</span> <strong>scan_state.json → registry.yaml:</strong> Migrar last_hash de cada source al nuevo formato del registry. Script de migracion one-shot.
+    </div>
+    <div style="background: #44475a; padding: 12px 16px; border-radius: 8px; margin-bottom: 8px;">
+      <span style="color: #50fa7b;">3.</span> <strong>Crear notebooks:</strong> Primer rondin post-deploy crea los notebooks en NotebookLM para cada proyecto registrado.
+    </div>
+    <div style="background: #44475a; padding: 12px 16px; border-radius: 8px; margin-bottom: 8px;">
+      <span style="color: #50fa7b;">4.</span> <strong>Endpoints backward-compatible:</strong> /health, /search, /scan siguen funcionando igual. Se agregan /registry y /metrics.
+    </div>
+    <div style="background: #44475a; padding: 12px 16px; border-radius: 8px;">
+      <span style="color: #50fa7b;">5.</span> <strong>eval-agent KPIs:</strong> Actualizar ~/ai-lab/agent-eval/kpis/erudito.yaml con los nuevos endpoints y probes.
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 16px; padding: 16px; background: #44475a; border-radius: 8px;">
+  <h3 style="color: #f1fa8c;">Decisiones de diseno</h3>
+  <ul style="line-height: 1.8; font-size: 13px;">
+    <li><strong>Docker, no bare metal:</strong> v2 corria directo como proceso Python. v3 va en container para consistencia con el resto del mesh y facilidad de restart/update.</li>
+    <li><strong>Repos montados read-only:</strong> Erudito lee los repos pero nunca los modifica. El auto-enrich de metadata genera el frontmatter en memoria, no escribe en el repo original.</li>
+    <li><strong>Misma red que LiteLLM:</strong> Ya existe, ya tiene acceso a Qdrant, Redis, Ollama, y NotebookLM MCP. No creamos red nueva.</li>
+    <li><strong>Sanitizer como compose service:</strong> Se despliega junto con Erudito pero es independiente. Si Erudito se reinicia, el sanitizer sigue corriendo y viceversa.</li>
+    <li><strong>Backward compatible:</strong> Los endpoints que existen hoy siguen funcionando. eval-agent no se rompe durante la migracion.</li>
+  </ul>
+</div>

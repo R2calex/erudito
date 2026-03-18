@@ -1,0 +1,155 @@
+<h2>Seccion 4/6 — Query Engine (Flujo de Consultas)</h2>
+<p class="subtitle">Como Erudito responde preguntas: cuando usa Qdrant, cuando escala a NotebookLM, y cuando dice "no se".</p>
+
+<div class="section">
+  <h3>Flujo de decision</h3>
+  <div class="mockup">
+    <div class="mockup-header">core/query.py — algoritmo de respuesta</div>
+    <div class="mockup-body" style="padding: 24px; font-size: 13px;">
+
+      <!-- Step 1 -->
+      <div style="display: flex; align-items: flex-start; gap: 12px; margin-bottom: 16px;">
+        <div style="background: #bd93f9; color: #282a36; padding: 4px 12px; border-radius: 12px; font-size: 11px; white-space: nowrap;">Paso 1</div>
+        <div>
+          <strong>Identificar proyecto</strong><br>
+          <span style="color: #6272a4; font-size: 12px;">Extraer de la pregunta a que proyecto se refiere. Si no se identifica → buscar en todo Qdrant (cross-project).</span>
+        </div>
+      </div>
+
+      <!-- Step 2 -->
+      <div style="display: flex; align-items: flex-start; gap: 12px; margin-bottom: 16px;">
+        <div style="background: #bd93f9; color: #282a36; padding: 4px 12px; border-radius: 12px; font-size: 11px; white-space: nowrap;">Paso 2</div>
+        <div>
+          <strong>Buscar en Qdrant</strong> (ambas collections)<br>
+          <span style="color: #6272a4; font-size: 12px;">Buscar en agent_knowledge + nlm_notes. Combinar resultados por score.</span>
+        </div>
+      </div>
+
+      <!-- Decision diamond -->
+      <div style="text-align: center; margin: 20px 0;">
+        <div style="background: #f1fa8c; color: #282a36; padding: 10px 20px; border-radius: 8px; display: inline-block; font-weight: bold;">
+          Mejor score >= 0.7?
+        </div>
+      </div>
+
+      <!-- Two branches -->
+      <div style="display: flex; justify-content: center; gap: 60px;">
+        <!-- YES branch -->
+        <div style="display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 200px;">
+          <div style="color: #50fa7b; font-weight: bold;">SI (score >= 0.7)</div>
+          <div style="background: #50fa7b; color: #282a36; padding: 8px 16px; border-radius: 8px; text-align: center; font-size: 12px;">
+            Responder directo<br>
+            <span style="font-size: 11px;">con los chunks relevantes</span>
+          </div>
+          <div style="font-size: 11px; color: #6272a4; text-align: center;">
+            Confianza: alta<br>
+            Fuente: Qdrant local
+          </div>
+        </div>
+
+        <!-- NO branch -->
+        <div style="display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 200px;">
+          <div style="color: #ffb86c; font-weight: bold;">NO (score < 0.7)</div>
+
+          <div style="text-align: center; margin: 4px 0;">
+            <div style="background: #f1fa8c; color: #282a36; padding: 6px 14px; border-radius: 8px; display: inline-block; font-size: 12px;">
+              Hay notebook_id?
+            </div>
+          </div>
+
+          <div style="display: flex; gap: 30px;">
+            <div style="display: flex; flex-direction: column; align-items: center; gap: 6px;">
+              <div style="color: #50fa7b; font-size: 12px;">SI</div>
+              <div style="background: #ff79c6; color: #282a36; padding: 6px 12px; border-radius: 6px; font-size: 11px; text-align: center;">
+                notebook_query<br>al notebook
+              </div>
+            </div>
+            <div style="display: flex; flex-direction: column; align-items: center; gap: 6px;">
+              <div style="color: #ff5555; font-size: 12px;">NO</div>
+              <div style="background: #44475a; padding: 6px 12px; border-radius: 6px; font-size: 11px; text-align: center;">
+                "No tengo info<br>suficiente"
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- After NLM -->
+      <div style="margin-top: 24px; text-align: center;">
+        <div style="background: #f1fa8c; color: #282a36; padding: 8px 16px; border-radius: 8px; display: inline-block; font-size: 12px; font-weight: bold;">
+          Despues de consultar NotebookLM
+        </div>
+      </div>
+
+      <div style="display: flex; justify-content: center; gap: 40px; margin-top: 12px;">
+        <div style="text-align: center; max-width: 180px;">
+          <div style="background: #50fa7b; color: #282a36; padding: 6px 12px; border-radius: 6px; font-size: 12px;">NLM responde bien</div>
+          <div style="font-size: 11px; color: #6272a4; margin-top: 4px;">Responder con la info de NLM.<br>Guardar nota en Qdrant<br>(enriquece para la proxima)</div>
+        </div>
+        <div style="text-align: center; max-width: 180px;">
+          <div style="background: #ffb86c; color: #282a36; padding: 6px 12px; border-radius: 6px; font-size: 12px;">NLM tampoco sabe</div>
+          <div style="font-size: 11px; color: #6272a4; margin-top: 4px;">"No tengo informacion.<br>Quieres que investigue?"</div>
+        </div>
+        <div style="text-align: center; max-width: 180px;">
+          <div style="background: #ff5555; color: #282a36; padding: 6px 12px; border-radius: 6px; font-size: 12px;">NLM no disponible</div>
+          <div style="font-size: 11px; color: #6272a4; margin-top: 4px;">Responder con lo que hay<br>en Qdrant (score bajo) +<br>disclaimer de baja confianza</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Cross-project (Flujo 4 del algoritmo)</h3>
+  <div class="mockup">
+    <div class="mockup-header">Preguntas que involucran multiples proyectos</div>
+    <div class="mockup-body" style="padding: 20px; font-size: 13px;">
+      <div style="background: #44475a; padding: 12px; border-radius: 8px; margin-bottom: 12px;">
+        <span style="color: #f1fa8c;">Ejemplo:</span> "Que servicios dependen de Qdrant en el mesh?"
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div><span style="color: #bd93f9;">1.</span> No se identifica un solo proyecto → busqueda global en Qdrant</div>
+        <div><span style="color: #bd93f9;">2.</span> Buscar en <code>agent_knowledge</code> + <code>nlm_notes</code> sin filtro de proyecto</div>
+        <div><span style="color: #bd93f9;">3.</span> Responder solo con Erudito (Qdrant) — <strong>NotebookLM no participa</strong></div>
+        <div style="color: #6272a4; font-size: 12px; padding-left: 20px;">
+          (porque NLM no puede cruzar notebooks)
+        </div>
+        <div><span style="color: #bd93f9;">4.</span> Si no hay suficiente info → "No tengo suficiente contexto cross-project"</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>Estructura de la respuesta</h3>
+  <div class="mockup">
+    <div class="mockup-header">Lo que Erudito retorna al caller</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 12px; line-height: 1.8; padding: 16px;">
+<span style="color: #8be9fd;">QueryResponse:</span>
+  <span style="color: #bd93f9;">answer:</span> "El texto de la respuesta..."
+  <span style="color: #bd93f9;">confidence:</span> high | medium | low
+  <span style="color: #bd93f9;">sources:</span>
+    - <span style="color: #bd93f9;">type:</span> qdrant | nlm_note | notebooklm_live
+      <span style="color: #bd93f9;">project:</span> infra-mcp
+      <span style="color: #bd93f9;">file:</span> README.md
+      <span style="color: #bd93f9;">score:</span> 0.85
+  <span style="color: #bd93f9;">project_identified:</span> infra-mcp | null
+  <span style="color: #bd93f9;">nlm_consulted:</span> true | false
+  <span style="color: #bd93f9;">suggestion:</span> null | "investigate_web" | "enrich_sources"
+    </div>
+  </div>
+  <div style="font-size: 12px; color: #6272a4; margin-top: 8px; line-height: 1.6;">
+    <strong>confidence</strong> se calcula: high (score >= 0.7), medium (score 0.4-0.7 + NLM confirm), low (score < 0.4 o NLM no disponible)<br>
+    <strong>suggestion</strong> indica al caller que puede hacer si la respuesta no es suficiente
+  </div>
+</div>
+
+<div class="section" style="margin-top: 16px; padding: 16px; background: #44475a; border-radius: 8px;">
+  <h3 style="color: #f1fa8c;">Decisiones de diseno</h3>
+  <ul style="line-height: 1.8; font-size: 13px;">
+    <li><strong>Umbral 0.7 configurable:</strong> Se puede ajustar via env var <code>ERUDITO_CONFIDENCE_THRESHOLD</code>. Empezamos con 0.7 y calibramos con los KPIs.</li>
+    <li><strong>NLM enriquece Qdrant on-the-fly:</strong> Si NLM responde algo util que no estaba en Qdrant, se guarda como nota. La proxima vez que pregunten algo similar, Qdrant lo tiene.</li>
+    <li><strong>"No se" explicito:</strong> Nunca inventar. Siempre ofrecer opciones: investigar en web, enriquecer fuentes, o simplemente "no hay info".</li>
+    <li><strong>Cross-project = solo Qdrant:</strong> NotebookLM no participa en queries multi-proyecto. Esto cambiaria con el mesh-overview notebook (backlog).</li>
+  </ul>
+</div>
