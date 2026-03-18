@@ -1,0 +1,44 @@
+services:
+  erudito:
+    build: .
+    container_name: erudito
+    ports:
+      - "100.119.223.20:8095:8095"
+      - "127.0.0.1:8095:8095"
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - LITELLM_URL=http://litellm-proxy-local:4000/v1
+      - REDIS_URL=redis://litellm-redis-local:6379
+      - SANITIZER_URL=http://sanitizer-hanzo:8086
+      - ERUDITO_CONFIDENCE_THRESHOLD=0.75
+      - SCAN_INTERVAL_MINUTES=15
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+      - ~/ai-lab:/mnt/ai-lab:ro
+      - ~/desarrollos_openclaw:/mnt/dev:ro
+    networks:
+      - litellm-local_litellm-network
+    restart: unless-stopped
+    depends_on:
+      - sanitizer-hanzo
+
+  sanitizer-hanzo:
+    image: kubo-sanitizer:local
+    container_name: sanitizer-hanzo
+    ports:
+      - "100.119.223.20:8086:8086"
+      - "127.0.0.1:8086:8086"
+    networks:
+      - litellm-local_litellm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  litellm-local_litellm-network:
+    external: true
