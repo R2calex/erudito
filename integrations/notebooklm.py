@@ -15,7 +15,9 @@ logger = logging.getLogger("erudito.notebooklm")
 
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
-MCP_ENDPOINT = f"{LITELLM_URL}/mcp/notebooklm_mcp"
+# MCP endpoint uses the base LiteLLM URL without /v1 suffix
+_LITELLM_BASE = LITELLM_URL.rstrip("/").removesuffix("/v1")
+MCP_ENDPOINT = f"{_LITELLM_BASE}/mcp/notebooklm_mcp"
 NLM_TIMEOUT = 60.0  # seconds
 NLM_SOURCE_LIMIT = 50
 

@@ -33,10 +33,12 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_MINUTES", "15")) * 60
 REGISTRY_YAML = os.path.join(DATA_DIR, "registry.yaml")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.jsonl")
 REDIS_URL = os.getenv("REDIS_URL", None)
+MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "3"))
 
 # Global state
 registry: Registry | None = None
 _scan_task: asyncio.Task | None = None
+_scan_semaphore: asyncio.Semaphore | None = None
 _coherence_cache: dict = {"score": None, "timestamp": None}
 _nlm_call_stats: dict = {"success": 0, "total": 0}
 _query_stats: dict = {"high": 0, "total": 0}
@@ -69,12 +71,19 @@ async def _scan_loop():
 
 
 async def _run_scan_all():
-    """Scan all projects for deltas and process them."""
-    global _last_scan_time
+    """Scan all projects with max concurrency limit."""
+    global _last_scan_time, _scan_semaphore
     if not registry:
         return
-    for project_name in registry.list_all():
-        await _scan_project(project_name)
+    if _scan_semaphore is None:
+        _scan_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+
+    async def _bounded_scan(name):
+        async with _scan_semaphore:
+            await _scan_project(name)
+
+    tasks = [_bounded_scan(name) for name in registry.list_all()]
+    await asyncio.gather(*tasks, return_exceptions=True)
     _last_scan_time = _now_iso()
 
 
@@ -120,9 +129,10 @@ async def _scan_project(project_name: str):
 
 
 async def _run_indexer(project_name: str, delta: dict):
-    """Run the indexer pipeline."""
+    """Run the indexer pipeline in a thread pool to avoid blocking the event loop."""
     try:
-        count = index_delta(delta)
+        loop = asyncio.get_event_loop()
+        count = await loop.run_in_executor(None, index_delta, delta)
         doc_count = len([f for f in delta["files"] if f["action"] != "deleted"])
         registry.update_sync(project_name, delta["new_hash"], doc_count=doc_count)
         logger.info(f"Indexed {count} points for {project_name}")
@@ -193,7 +203,7 @@ async def _run_nlm_cycle(project_name: str, delta: dict):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: init services and start scan loop."""
-    global registry, _scan_task
+    global registry, _scan_task, _scan_semaphore
 
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     registry = Registry(yaml_path=REGISTRY_YAML, redis_url=REDIS_URL)
@@ -205,8 +215,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Qdrant init warning: {e}")
 
-    # Start background scan
+    # Init concurrency control and start background scan
+    _scan_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
     _scan_task = asyncio.create_task(_scan_loop())
+    logger.info(f"Max concurrent scans: {MAX_CONCURRENT_SCANS}")
     logger.info(f"Erudito v3 started. Scan interval: {SCAN_INTERVAL}s")
 
     yield
