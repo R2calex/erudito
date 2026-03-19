@@ -34,6 +34,7 @@ REGISTRY_YAML = os.path.join(DATA_DIR, "registry.yaml")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.jsonl")
 REDIS_URL = os.getenv("REDIS_URL", None)
 MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "3"))
+NLM_ENABLED = os.getenv("NLM_ENABLED", "false").lower() == "true"
 
 # Global state
 registry: Registry | None = None
@@ -121,11 +122,13 @@ async def _scan_project(project_name: str):
             if f.get("auto_enriched"):
                 _auto_enriched_files += 1
 
-    # Run Indexer and NLM cycle in parallel
+    # Run Indexer (always) and NLM cycle (only if enabled)
     indexer_task = asyncio.create_task(_run_indexer(project_name, delta))
-    nlm_task = asyncio.create_task(_run_nlm_cycle(project_name, delta))
-
-    await asyncio.gather(indexer_task, nlm_task, return_exceptions=True)
+    if NLM_ENABLED:
+        nlm_task = asyncio.create_task(_run_nlm_cycle(project_name, delta))
+        await asyncio.gather(indexer_task, nlm_task, return_exceptions=True)
+    else:
+        await indexer_task
 
 
 async def _run_indexer(project_name: str, delta: dict):

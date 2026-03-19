@@ -15,9 +15,9 @@ logger = logging.getLogger("erudito.notebooklm")
 
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
-# MCP endpoint uses the base LiteLLM URL without /v1 suffix
-_LITELLM_BASE = LITELLM_URL.rstrip("/").removesuffix("/v1")
-MCP_ENDPOINT = f"{_LITELLM_BASE}/mcp/notebooklm_mcp"
+# Direct connection to NotebookLM MCP server (bypasses LiteLLM proxy due to Streamable HTTP bug)
+NLM_MCP_URL = os.getenv("NLM_MCP_URL", "http://notebooklm-mcp:8765/mcp")
+MCP_ENDPOINT = NLM_MCP_URL
 NLM_TIMEOUT = 60.0  # seconds
 NLM_SOURCE_LIMIT = 50
 
@@ -41,7 +41,7 @@ def build_mcp_request(tool_name: str, arguments: dict) -> dict:
         "method": "tools/call",
         "id": _REQUEST_ID,
         "params": {
-            "name": f"notebooklm_mcp-{tool_name}",
+            "name": tool_name,
             "arguments": arguments,
         },
     }
@@ -76,18 +76,64 @@ def _parse_sse_response(text: str) -> dict | None:
         return None
 
 
+# Session state for MCP Streamable HTTP
+_session_id: str | None = None
+_session_initialized: bool = False
+
+
+async def _ensure_session(client: httpx.AsyncClient) -> bool:
+    """Initialize MCP session if not already done. Returns True on success."""
+    global _session_id, _session_initialized
+    if _session_initialized and _session_id:
+        return True
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    init_request = {
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "id": 0,
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "erudito", "version": "3.0"},
+        },
+    }
+    try:
+        resp = await client.post(MCP_ENDPOINT, json=init_request, headers=headers)
+        resp.raise_for_status()
+        # Extract session ID from response headers
+        _session_id = resp.headers.get("mcp-session-id")
+        _session_initialized = True
+        logger.info(f"NLM MCP session initialized (session_id={_session_id})")
+        return True
+    except Exception as e:
+        logger.warning(f"NLM MCP session init failed: {e}")
+        _session_initialized = False
+        _session_id = None
+        return False
+
+
 async def _call_mcp(tool_name: str, arguments: dict) -> dict | None:
-    """Call a NotebookLM MCP tool via LiteLLM. Returns parsed result or None."""
+    """Call a NotebookLM MCP tool directly. Returns parsed result or None."""
     request = build_mcp_request(tool_name, arguments)
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     }
-    if LITELLM_API_KEY:
-        headers["Authorization"] = f"Bearer {LITELLM_API_KEY}"
+    if _session_id:
+        headers["Mcp-Session-Id"] = _session_id
 
     try:
         async with httpx.AsyncClient(timeout=NLM_TIMEOUT) as client:
+            # Ensure session is initialized
+            if not await _ensure_session(client):
+                return None
+            # Add session ID after init
+            if _session_id:
+                headers["Mcp-Session-Id"] = _session_id
             resp = await client.post(MCP_ENDPOINT, json=request, headers=headers)
             resp.raise_for_status()
             raw = _parse_sse_response(resp.text)
@@ -95,6 +141,9 @@ async def _call_mcp(tool_name: str, arguments: dict) -> dict | None:
                 return parse_mcp_response(raw)
     except Exception as e:
         logger.warning(f"NLM MCP call failed ({tool_name}): {e}")
+        # Reset session on error so next call re-initializes
+        global _session_initialized
+        _session_initialized = False
     return None
 
 
