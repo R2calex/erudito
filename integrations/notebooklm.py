@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import asyncio
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -41,7 +42,7 @@ def build_mcp_request(tool_name: str, arguments: dict) -> dict:
         "method": "tools/call",
         "id": _REQUEST_ID,
         "params": {
-            "name": tool_name,
+            "name": f"notebooklm_mcp-{tool_name}",
             "arguments": arguments,
         },
     }
@@ -194,76 +195,86 @@ async def get_notebook_info(notebook_id: str) -> dict | None:
 
 async def run_nlm_cycle(
     notebook_id: str,
-    delta: dict,
+    curated_dir: str,
+    project_name: str = "",
     dynamic_question_generator=None,
 ) -> dict:
     """Run the full NotebookLM validation cycle for a project.
 
-    1. Check source limits
-    2. Add sources
-    3. Condense
-    4. Ask questions (5 fixed + up to 5 dynamic)
-    5. Create notes
-    6. Return notes for Qdrant storage
+    Reads curated .md files from curated_dir, uploads as sources,
+    asks fixed + dynamic questions, saves notes.
 
-    Returns: {success: bool, notes: list[dict], source_count: int}
+    Returns: {success: bool, notes: list[dict], sources_uploaded: int}
     """
-    result = {"success": False, "notes": [], "source_count": 0}
+    result = {"success": False, "notes": [], "sources_uploaded": 0}
 
-    # 1. Check source count
+    curated_path = Path(curated_dir)
+    if not curated_path.is_dir():
+        logger.warning(f"Curated dir not found: {curated_dir}")
+        return result
+
+    curated_files = sorted(curated_path.glob("*.md"))
+    if not curated_files:
+        logger.warning(f"No curated files in {curated_dir}")
+        return result
+
     info = await get_notebook_info(notebook_id)
     current_sources = 0
     if info:
         sources = info.get("sources", [])
         current_sources = len(sources) if isinstance(sources, list) else 0
 
-    new_files = [f for f in delta["files"] if f["action"] != "deleted"]
     skip_source_add = False
-    if current_sources + len(new_files) > NLM_SOURCE_LIMIT:
+    if current_sources + len(curated_files) > NLM_SOURCE_LIMIT:
         logger.warning(
             f"Notebook {notebook_id} would exceed {NLM_SOURCE_LIMIT} sources "
-            f"({current_sources} + {len(new_files)}). Skipping source_add, continuing with questions."
+            f"({current_sources} + {len(curated_files)}). Skipping source_add."
         )
         skip_source_add = True
 
-    # 2. Add sources (skip if over limit)
     if not skip_source_add:
-        for file_info in new_files:
-            ok = await add_source(notebook_id, file_info["content"], file_info["path"])
+        for cf in curated_files:
+            content = cf.read_text(encoding="utf-8")
+            ok = await add_source(notebook_id, content, cf.name)
             if ok:
-                current_sources += 1
-    result["source_count"] = current_sources
+                result["sources_uploaded"] += 1
 
-    # 3. Wait for processing
     await asyncio.sleep(20)
 
-    # 4. Condense
-    condensed = await query_notebook(notebook_id, "Condense all the information from the sources into a comprehensive summary.")
+    condensed = await query_notebook(
+        notebook_id,
+        "Condense all the information from the sources into a comprehensive summary."
+    )
     if condensed:
         result["notes"].append({
             "type": "condensed",
             "question": "Condense all sources",
             "answer": condensed,
-            "project": delta["project"],
+            "project": project_name,
         })
 
-    # 5. Ask questions
-    questions = list(FIXED_QUESTIONS)
-    if dynamic_question_generator:
-        dynamic = dynamic_question_generator(delta)
-        questions.extend(dynamic[:5])
-
-    for question in questions:
+    for question in FIXED_QUESTIONS:
         answer = await query_notebook(notebook_id, question)
         if answer:
             result["notes"].append({
                 "type": "qa",
                 "question": question,
                 "answer": answer,
-                "project": delta["project"],
+                "project": project_name,
             })
 
-    # 6. Create notes in notebook
+    if dynamic_question_generator:
+        dynamic = dynamic_question_generator(curated_dir)
+        for question in dynamic[:5]:
+            answer = await query_notebook(notebook_id, question)
+            if answer:
+                result["notes"].append({
+                    "type": "qa_dynamic",
+                    "question": question,
+                    "answer": answer,
+                    "project": project_name,
+                })
+
     for note in result["notes"]:
         note_text = f"Q: {note['question']}\nA: {note['answer']}"
         saved = await create_note(notebook_id, note_text)

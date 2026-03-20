@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import yaml
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,10 +15,12 @@ from pathlib import Path
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
 
+from core.curator import curate_project
 from core.registry import Registry
 from core.scanner import compute_delta
 from core.indexer import (
     index_delta, ensure_collection, embed_text, search,
+    upsert_points, generate_point_id,
     COLLECTION_KNOWLEDGE, COLLECTION_NLM_NOTES,
 )
 from core.query import execute_query
@@ -34,12 +37,16 @@ REGISTRY_YAML = os.path.join(DATA_DIR, "registry.yaml")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.jsonl")
 REDIS_URL = os.getenv("REDIS_URL", None)
 MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "3"))
+CURATED_DIR = os.path.join(DATA_DIR, "curated")
+MAX_CONCURRENT_NLM = int(os.getenv("MAX_CONCURRENT_NLM", "2"))
 NLM_ENABLED = os.getenv("NLM_ENABLED", "false").lower() == "true"
 
 # Global state
 registry: Registry | None = None
 _scan_task: asyncio.Task | None = None
+_nlm_sync_task: asyncio.Task | None = None
 _scan_semaphore: asyncio.Semaphore | None = None
+_nlm_semaphore: asyncio.Semaphore | None = None
 _coherence_cache: dict = {"score": None, "timestamp": None}
 _nlm_call_stats: dict = {"success": 0, "total": 0}
 _query_stats: dict = {"high": 0, "total": 0}
@@ -122,61 +129,131 @@ async def _scan_project(project_name: str):
             if f.get("auto_enriched"):
                 _auto_enriched_files += 1
 
-    # Run Indexer (always) and NLM cycle (only if enabled)
-    indexer_task = asyncio.create_task(_run_indexer(project_name, delta))
-    if NLM_ENABLED:
-        nlm_task = asyncio.create_task(_run_nlm_cycle(project_name, delta))
-        await asyncio.gather(indexer_task, nlm_task, return_exceptions=True)
-    else:
-        await indexer_task
-
-
-async def _run_indexer(project_name: str, delta: dict):
-    """Run the indexer pipeline in a thread pool to avoid blocking the event loop."""
+    # Run Curator (replaces direct indexing)
     try:
-        loop = asyncio.get_event_loop()
-        count = await loop.run_in_executor(None, index_delta, delta)
-        doc_count = len([f for f in delta["files"] if f["action"] != "deleted"])
-        registry.update_sync(project_name, delta["new_hash"], doc_count=doc_count)
-        logger.info(f"Indexed {count} points for {project_name}")
-        audit_log({"action": "index_complete", "project": project_name, "points": count})
+        curation_result = curate_project(
+            project_name, repo_path, delta["files"], CURATED_DIR
+        )
+        if curation_result.success and curation_result.curated_files > 0:
+            project = registry._data["projects"].get(project_name)
+            if project:
+                project["curation_status"] = "curated"
+                project["curated_at"] = _now_iso()
+                project["curated_files"] = curation_result.curated_files
+                registry._persist()
+            registry.update_sync(project_name, delta["new_hash"],
+                                 doc_count=len([f for f in delta["files"] if f["action"] != "deleted"]))
+            audit_log({
+                "action": "curation_complete",
+                "project": project_name,
+                "features": curation_result.features,
+                "curated_files": curation_result.curated_files,
+            })
+            logger.info(f"Curated {project_name}: {curation_result.curated_files} features")
+        elif curation_result.errors:
+            project = registry._data["projects"].get(project_name)
+            if project:
+                project["curation_status"] = "error"
+                registry._persist()
+            audit_log({
+                "action": "curation_error",
+                "project": project_name,
+                "errors": curation_result.errors,
+            })
     except Exception as e:
-        logger.error(f"Indexer failed for {project_name}: {e}")
-        audit_log({"action": "index_error", "project": project_name, "error": str(e)})
+        logger.error(f"Curation failed for {project_name}: {e}")
+        audit_log({"action": "curation_error", "project": project_name, "error": str(e)})
+
+    # Cleanup curated files for features with all sources deleted
+    deleted_files = [f["path"] for f in delta["files"] if f["action"] == "deleted"]
+    if deleted_files:
+        curated_project_dir = Path(CURATED_DIR) / project_name
+        if curated_project_dir.is_dir():
+            for curated_file in curated_project_dir.glob("*.md"):
+                try:
+                    content = curated_file.read_text(encoding="utf-8")
+                    if content.startswith("---"):
+                        fm_end = content.index("---", 3)
+                        fm = yaml.safe_load(content[3:fm_end])
+                        sources = fm.get("source_files", [])
+                        if sources and all(s in deleted_files for s in sources):
+                            curated_file.unlink()
+                            audit_log({"action": "curation_cleanup", "project": project_name, "file": curated_file.name})
+                            logger.info(f"Cleaned up curated file: {curated_file.name}")
+                except Exception as e:
+                    logger.warning(f"Cleanup check failed for {curated_file}: {e}")
 
 
-async def _run_nlm_cycle(project_name: str, delta: dict):
-    """Run the NotebookLM validation cycle."""
+async def _nlm_sync_loop():
+    """Background NLM sync loop. Runs offset from scan loop."""
+    await asyncio.sleep(300)  # 5-minute offset from scan loop
+    while True:
+        try:
+            await _run_nlm_sync_all()
+        except Exception as e:
+            logger.error(f"NLM sync loop error: {e}")
+            audit_log({"action": "nlm_sync_error", "error": str(e)})
+        await asyncio.sleep(SCAN_INTERVAL)
+
+
+async def _run_nlm_sync_all():
+    """Sync all curated projects with NLM, max 2 concurrent."""
+    global _nlm_semaphore
+    if not registry or not NLM_ENABLED:
+        return
+    if _nlm_semaphore is None:
+        _nlm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NLM)
+
+    candidates = []
+    for name in registry.list_all():
+        entry = registry.get(name)
+        if entry and entry.get("curation_status") == "curated":
+            candidates.append(name)
+
+    if not candidates:
+        return
+
+    logger.info(f"NLM sync: {len(candidates)} projects to process")
+
+    async def _bounded_sync(name):
+        async with _nlm_semaphore:
+            await _nlm_sync_project(name)
+
+    tasks = [_bounded_sync(name) for name in candidates]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _nlm_sync_project(project_name: str):
+    """Sync a single project with NLM using curated files."""
     entry = registry.get(project_name)
     if not entry:
         return
 
     notebook_id = entry.get("notebook_id")
 
-    # Create notebook if needed
     if not notebook_id:
         notebook_id = await nlm.create_notebook(f"AI-Lab: {project_name}")
         if notebook_id:
-            # Only update notebook_id, don't touch hash/status (indexer handles that)
-            entry = registry.get(project_name)
-            if entry:
-                registry._data["projects"][project_name]["notebook_id"] = notebook_id
-                registry._persist()
+            registry._data["projects"][project_name]["notebook_id"] = notebook_id
+            registry._persist()
             logger.info(f"Created notebook for {project_name}: {notebook_id}")
         else:
+            project = registry._data["projects"].get(project_name)
+            if project:
+                project["nlm_consecutive_failures"] = project.get("nlm_consecutive_failures", 0) + 1
+                registry._persist()
             _nlm_call_stats["total"] += 1
             logger.warning(f"Failed to create notebook for {project_name}")
             return
 
+    curated_dir = os.path.join(CURATED_DIR, project_name)
     _nlm_call_stats["total"] += 1
-    result = await nlm.run_nlm_cycle(notebook_id, delta)
+    result = await nlm.run_nlm_cycle(notebook_id, curated_dir, project_name=project_name)
 
     if result["success"]:
         _nlm_call_stats["success"] += 1
-        # Store notes in Qdrant nlm_notes collection
         for note in result["notes"]:
             embedding = embed_text(f"{note['question']} {note['answer']}")
-            from core.indexer import upsert_points, generate_point_id
             point_id = generate_point_id(f"nlm:{project_name}:{note['question'][:50]}", 0)
             upsert_points([{
                 "id": point_id,
@@ -192,23 +269,66 @@ async def _run_nlm_cycle(project_name: str, delta: dict):
                 },
             }], COLLECTION_NLM_NOTES)
 
-        # Update nlm_source_count and mark validated
-        entry = registry.get(project_name)
-        if entry:
-            registry._data["projects"][project_name]["nlm_source_count"] = result["source_count"]
+        project = registry._data["projects"].get(project_name)
+        if project:
+            project["nlm_source_count"] = result["sources_uploaded"]
+            project["nlm_consecutive_failures"] = 0
+            registry._persist()
         registry.mark_validated(project_name, coverage=1.0)
         audit_log({"action": "nlm_validated", "project": project_name, "notes": len(result["notes"])})
     else:
+        project = registry._data["projects"].get(project_name)
+        if project:
+            failures = project.get("nlm_consecutive_failures", 0) + 1
+            project["nlm_consecutive_failures"] = failures
+            registry._persist()
+
+            if failures >= 3:
+                logger.warning(f"NLM failed {failures}x for {project_name}, falling back to direct indexing")
+                await _fallback_index_curated(project_name)
+
         logger.warning(f"NLM cycle failed for {project_name}")
         audit_log({"action": "nlm_failed", "project": project_name})
 
 
+async def _fallback_index_curated(project_name: str):
+    """Fallback: index curated docs directly to agent_knowledge when NLM is unavailable."""
+    curated_dir = os.path.join(CURATED_DIR, project_name)
+    curated_path = Path(curated_dir)
+    if not curated_path.is_dir():
+        return
+
+    delta_files = []
+    for md_file in sorted(curated_path.glob("*.md")):
+        delta_files.append({
+            "path": str(md_file),
+            "content": md_file.read_text(encoding="utf-8"),
+            "action": "modified",
+        })
+
+    if delta_files:
+        try:
+            loop = asyncio.get_event_loop()
+            delta = {
+                "project": project_name,
+                "old_hash": None,
+                "new_hash": "fallback",
+                "files": delta_files,
+            }
+            count = await loop.run_in_executor(None, index_delta, delta)
+            logger.info(f"Fallback indexed {count} points for {project_name}")
+            audit_log({"action": "fallback_index", "project": project_name, "points": count})
+        except Exception as e:
+            logger.error(f"Fallback indexing failed for {project_name}: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: init services and start scan loop."""
-    global registry, _scan_task, _scan_semaphore
+    """Application lifespan: init services and start background loops."""
+    global registry, _scan_task, _nlm_sync_task, _scan_semaphore, _nlm_semaphore
 
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(CURATED_DIR).mkdir(parents=True, exist_ok=True)
     registry = Registry(yaml_path=REGISTRY_YAML, redis_url=REDIS_URL)
 
     # Ensure Qdrant collections exist
@@ -218,9 +338,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Qdrant init warning: {e}")
 
-    # Init concurrency control and start background scan
+    # Init concurrency control and start background loops
     _scan_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+    _nlm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NLM)
     _scan_task = asyncio.create_task(_scan_loop())
+    if NLM_ENABLED:
+        _nlm_sync_task = asyncio.create_task(_nlm_sync_loop())
+        logger.info(f"NLM sync enabled. Max concurrent: {MAX_CONCURRENT_NLM}")
     logger.info(f"Max concurrent scans: {MAX_CONCURRENT_SCANS}")
     logger.info(f"Erudito v3 started. Scan interval: {SCAN_INTERVAL}s")
 
@@ -229,6 +353,8 @@ async def lifespan(app: FastAPI):
     # Cleanup
     if _scan_task:
         _scan_task.cancel()
+    if _nlm_sync_task:
+        _nlm_sync_task.cancel()
 
 
 app = FastAPI(title="Erudito v3", version="3.0.0", lifespan=lifespan)
