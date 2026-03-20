@@ -33,8 +33,9 @@ _DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}-|\d{8}-)")
 
 
 def extract_feature_name(filename: str) -> str:
-    """Extract normalized feature name from a filename."""
-    name = filename
+    """Extract normalized feature name from a filename (or path)."""
+    # Use only the basename if a path is provided
+    name = os.path.basename(filename)
     if name.endswith(".md"):
         name = name[:-3]
     name = _PREFIX_RE.sub("", name)
@@ -89,7 +90,7 @@ class FileInfo(NamedTuple):
 
 def classify_doc_type(filename: str) -> tuple[str, int]:
     """Classify a file by its type prefix. Returns (section_title, sort_order)."""
-    upper = filename.upper()
+    upper = os.path.basename(filename).upper()
     for prefix, (section, order) in DOC_TYPES.items():
         if upper.startswith(f"{prefix}-"):
             return section, order
