@@ -47,6 +47,13 @@ class TestMetricsEndpoint:
         assert "coverage" in data
         assert "freshness_avg_minutes" in data
 
+    def test_metrics_includes_curation(self):
+        import httpx
+        resp = httpx.get("http://localhost:8095/metrics")
+        data = resp.json()
+        assert "curation_pct" in data["coverage"]
+        assert "curation_pending" in data["coverage"]
+
 
 @pytest.mark.integration
 class TestSearchEndpoint:
