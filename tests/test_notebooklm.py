@@ -11,7 +11,7 @@ class TestMCPProtocol:
         req = build_mcp_request("notebook_list", {"max_results": 10})
         assert req["jsonrpc"] == "2.0"
         assert req["method"] == "tools/call"
-        assert req["params"]["name"] == "notebooklm_mcp-notebook_list"
+        assert req["params"]["name"] == "notebook_list"
         assert req["params"]["arguments"]["max_results"] == 10
 
     def test_parse_success_response(self):

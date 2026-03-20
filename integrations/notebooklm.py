@@ -42,7 +42,7 @@ def build_mcp_request(tool_name: str, arguments: dict) -> dict:
         "method": "tools/call",
         "id": _REQUEST_ID,
         "params": {
-            "name": f"notebooklm_mcp-{tool_name}",
+            "name": tool_name,
             "arguments": arguments,
         },
     }
