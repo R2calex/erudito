@@ -49,15 +49,24 @@ def build_mcp_request(tool_name: str, arguments: dict) -> dict:
 
 
 def parse_mcp_response(raw: dict) -> dict | None:
-    """Parse MCP response, handling nested JSON in content[0].text."""
+    """Parse MCP response, handling nested JSON or plain text in content[0].text."""
     if "error" in raw:
         logger.warning(f"NLM MCP error: {raw['error']}")
         return None
     try:
-        content = raw["result"]["content"]
+        result = raw.get("result", {})
+        if result.get("isError"):
+            logger.warning(f"NLM tool error: {result.get('content', [{}])[0].get('text', 'unknown')}")
+            return None
+        content = result["content"]
         if content and content[0]["type"] == "text":
-            return json.loads(content[0]["text"])
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
+            text = content[0]["text"]
+            # Try JSON first, fall back to plain text wrapper
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"text": text}
+    except (KeyError, IndexError) as e:
         logger.warning(f"Failed to parse NLM response: {e}")
     return None
 
@@ -158,10 +167,15 @@ async def create_notebook(title: str) -> str | None:
 
 async def add_source(notebook_id: str, content: str, title: str = "") -> bool:
     """Add a text source to a notebook. Returns True on success."""
-    result = await _call_mcp("source_add", {
+    args = {
         "notebook_id": notebook_id,
-        "source": content,
-    })
+        "source_type": "text",
+        "text": content,
+        "wait": True,
+    }
+    if title:
+        args["title"] = title
+    result = await _call_mcp("source_add", args)
     return result is not None
 
 
@@ -172,10 +186,10 @@ async def query_notebook(notebook_id: str, query: str) -> str | None:
         "query": query,
     })
     if result:
-        # Response may be string or dict with 'answer' key
         if isinstance(result, str):
             return result
-        return result.get("answer") or result.get("response") or str(result)
+        # Try common response fields, including plain text wrapper from parse_mcp_response
+        return result.get("answer") or result.get("response") or result.get("text") or str(result)
     return None
 
 
@@ -183,7 +197,8 @@ async def create_note(notebook_id: str, note_text: str) -> bool:
     """Create a note in a notebook. Returns True on success."""
     result = await _call_mcp("note", {
         "notebook_id": notebook_id,
-        "note": note_text,
+        "action": "create",
+        "content": note_text,
     })
     return result is not None
 
