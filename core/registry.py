@@ -26,6 +26,10 @@ _DEFAULT_ENTRY = {
     "doc_count": 0,
     "last_nlm_session": None,
     "nlm_source_count": 0,
+    "curation_status": "uncurated",
+    "curated_at": None,
+    "curated_files": 0,
+    "nlm_consecutive_failures": 0,
 }
 
 
@@ -195,9 +199,16 @@ class Registry:
         projects = self._data["projects"]
         total = len(projects)
         by_status = {}
+        curation_curated = 0
+        curation_pending = 0
         for entry in projects.values():
             s = entry["status"]
             by_status[s] = by_status.get(s, 0) + 1
+            cs = entry.get("curation_status", "uncurated")
+            if cs == "curated":
+                curation_curated += 1
+            elif cs in ("uncurated", "stale"):
+                curation_pending += 1
         validated = by_status.get("validated", 0)
         synced = by_status.get("synced", 0)
         return {
@@ -208,4 +219,6 @@ class Registry:
             "pending": by_status.get("pending", 0),
             "coverage_pct": round(validated / total * 100, 1) if total else 0.0,
             "coverage_partial_pct": round((validated + synced) / total * 100, 1) if total else 0.0,
+            "curation_pct": round(curation_curated / total * 100, 1) if total else 0.0,
+            "curation_pending": curation_pending,
         }

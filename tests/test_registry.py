@@ -100,3 +100,19 @@ class TestRegistryPersistence:
         tmp_registry.register("b", path="/b", node="hanzo", repo="r/b")
         all_projects = tmp_registry.list_all()
         assert set(all_projects) == {"a", "b"}
+
+
+class TestCurationFields:
+    def test_default_entry_has_curation_fields(self, tmp_registry):
+        tmp_registry.register("test", "/tmp/test", "hanzo", "")
+        entry = tmp_registry.get("test")
+        assert entry["curation_status"] == "uncurated"
+        assert entry["curated_at"] is None
+        assert entry["curated_files"] == 0
+        assert entry["nlm_consecutive_failures"] == 0
+
+    def test_summary_includes_curation(self, tmp_registry):
+        tmp_registry.register("a", "/tmp/a", "hanzo", "")
+        summary = tmp_registry.summary()
+        assert "curation_pct" in summary
+        assert "curation_pending" in summary
