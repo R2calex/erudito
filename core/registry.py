@@ -148,7 +148,10 @@ class Registry:
     def get(self, name: str) -> dict | None:
         entry = self._data["projects"].get(name)
         if entry:
-            return dict(entry)
+            # Merge with defaults so old entries get new fields
+            merged = dict(_DEFAULT_ENTRY)
+            merged.update(entry)
+            return merged
         return None
 
     def update_sync(
