@@ -28,6 +28,25 @@ class TestMCPProtocol:
         parsed = parse_mcp_response(raw)
         assert parsed is None
 
+    def test_parse_tool_error_response(self):
+        raw = {
+            "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "Unknown tool: 'bad_tool'"}]
+            }
+        }
+        parsed = parse_mcp_response(raw)
+        assert parsed is None
+
+    def test_parse_plain_text_response(self):
+        raw = {
+            "result": {
+                "content": [{"type": "text", "text": "This is a plain text answer, not JSON."}]
+            }
+        }
+        parsed = parse_mcp_response(raw)
+        assert parsed == {"text": "This is a plain text answer, not JSON."}
+
 
 class TestFixedQuestions:
     def test_has_five_questions(self):

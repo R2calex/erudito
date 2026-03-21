@@ -232,7 +232,7 @@ async def _nlm_sync_project(project_name: str):
     notebook_id = entry.get("notebook_id")
 
     if not notebook_id:
-        notebook_id = await nlm.create_notebook(f"AI-Lab: {project_name}")
+        notebook_id = await nlm.ensure_notebook(f"AI-Lab: {project_name}")
         if notebook_id:
             registry._data["projects"][project_name]["notebook_id"] = notebook_id
             registry._persist()
