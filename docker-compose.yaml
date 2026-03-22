@@ -17,6 +17,9 @@ services:
       - NLM_ENABLED=true
       - NLM_MCP_URL=http://notebooklm-mcp:8765/mcp
       - MAX_CONCURRENT_NLM=2
+      - LOCAL_NODE=hanzo
+      - DEVOPS_AGENT_KUBO=http://100.66.123.113:8091
+      - DEVOPS_AGENT_SARIATU=http://100.76.110.104:8090
     volumes:
       - ./data:/app/data
       - /home/r0calex/ai-lab:/home/r0calex/ai-lab:ro

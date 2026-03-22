@@ -40,6 +40,14 @@ MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "3"))
 CURATED_DIR = os.path.join(DATA_DIR, "curated")
 MAX_CONCURRENT_NLM = int(os.getenv("MAX_CONCURRENT_NLM", "2"))
 NLM_ENABLED = os.getenv("NLM_ENABLED", "false").lower() == "true"
+INGESTED_DIR = os.path.join(DATA_DIR, "ingested")
+
+# Node → DevOps Agent URL mapping for remote file discovery
+NODE_DEVOPS_AGENTS = {
+    "kubo": os.getenv("DEVOPS_AGENT_KUBO", "http://100.66.123.113:8091"),
+    "sariatu": os.getenv("DEVOPS_AGENT_SARIATU", "http://100.76.110.104:8090"),
+}
+LOCAL_NODE = os.getenv("LOCAL_NODE", "hanzo")
 
 # Global state
 registry: Registry | None = None
@@ -95,12 +103,114 @@ async def _run_scan_all():
     _last_scan_time = _now_iso()
 
 
+async def _pull_remote_docs(project_name: str, entry: dict) -> bool:
+    """Pull .md files from a remote node's devops-agent into data/ingested/{project}/."""
+    node = entry.get("node", "")
+    agent_url = NODE_DEVOPS_AGENTS.get(node)
+    if not agent_url:
+        logger.warning(f"No devops-agent URL for node '{node}' (project {project_name})")
+        return False
+
+    repo_path = entry.get("path", "")
+    if not repo_path:
+        return False
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: List .md files on the remote node
+            resp = await client.get(f"{agent_url}/files", params={"path": repo_path})
+            resp.raise_for_status()
+            file_list = resp.json().get("files", [])
+
+            if not file_list:
+                logger.info(f"No .md files found on {node} for {project_name}")
+                return False
+
+            # Step 2: Get content of all files
+            file_paths = [f["path"] for f in file_list]
+            resp2 = await client.post(f"{agent_url}/files/content", json={
+                "path": repo_path,
+                "files": file_paths,
+            })
+            resp2.raise_for_status()
+            remote_files = resp2.json().get("files", [])
+
+            # Step 3: Store in ingested dir
+            ingest_dir = Path(INGESTED_DIR) / project_name
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            stored = 0
+            for f in remote_files:
+                safe_name = os.path.basename(f["path"])
+                (ingest_dir / safe_name).write_text(f["content"], encoding="utf-8")
+                stored += 1
+
+            logger.info(f"Pulled {stored} files from {node}:{repo_path} for {project_name}")
+            audit_log({"action": "remote_pull", "project": project_name, "node": node, "files": stored})
+            return stored > 0
+
+    except Exception as e:
+        logger.warning(f"Remote pull failed for {project_name} from {node}: {e}")
+        return False
+
+
 async def _scan_project(project_name: str):
-    """Scan a single project for changes."""
+    """Scan a single project for changes. Handles both local and remote projects."""
     entry = registry.get(project_name)
     if not entry:
         return
 
+    node = entry.get("node", LOCAL_NODE)
+    is_remote = node != LOCAL_NODE and node in NODE_DEVOPS_AGENTS
+
+    if is_remote:
+        # Remote project: pull docs via devops-agent, then curate from ingested dir
+        pulled = await _pull_remote_docs(project_name, entry)
+        if not pulled:
+            return
+
+        ingest_dir = Path(INGESTED_DIR) / project_name
+        delta_files = []
+        for md_file in sorted(ingest_dir.glob("*.md")):
+            delta_files.append({
+                "path": md_file.name,
+                "content": md_file.read_text(encoding="utf-8"),
+                "action": "added",
+            })
+
+        if not delta_files:
+            return
+
+        logger.info(f"Remote delta for {project_name}: {len(delta_files)} files from {node}")
+        audit_log({"action": "delta_detected", "project": project_name,
+                   "files": len(delta_files), "source": f"remote:{node}"})
+
+        # Sanitize
+        for file_info in delta_files:
+            if file_info["content"]:
+                result = await sanitize_text(file_info["content"])
+                file_info["content"] = result["sanitized"]
+
+        # Curate
+        try:
+            curation_result = curate_project(project_name, str(ingest_dir), delta_files, CURATED_DIR)
+            if curation_result.success and curation_result.curated_files > 0:
+                proj = registry._data["projects"].get(project_name)
+                if proj:
+                    proj["curation_status"] = "curated"
+                    proj["curated_at"] = _now_iso()
+                    proj["curated_files"] = curation_result.curated_files
+                    proj["doc_count"] = len(delta_files)
+                    registry._persist()
+                audit_log({"action": "curation_complete", "project": project_name,
+                           "features": curation_result.features, "source": f"remote:{node}"})
+                logger.info(f"Curated {project_name} (remote/{node}): {curation_result.curated_files} features")
+        except Exception as e:
+            logger.error(f"Curation failed for remote {project_name}: {e}")
+        return
+
+    # Local project: standard scan
     repo_path = os.path.expanduser(entry["path"])
     if not os.path.isdir(repo_path):
         logger.warning(f"Path not found for {project_name}: {repo_path}")
@@ -505,8 +615,6 @@ async def register_project(data: dict):
 
 
 # --- Ingest Endpoint (for remote nodes) ---
-
-INGESTED_DIR = os.path.join(DATA_DIR, "ingested")
 
 
 @app.post("/ingest/{project}")
