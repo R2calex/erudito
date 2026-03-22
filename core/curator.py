@@ -44,8 +44,17 @@ def extract_feature_name(filename: str) -> str:
     return name if name else filename.lower().replace(".md", "")
 
 
+MAX_FEATURES = int(os.getenv("MAX_CURATED_FEATURES", "45"))
+
+
 def group_by_feature(filenames: list[str]) -> dict[str, list[str]]:
-    """Group filenames by shared feature prefix using frequency detection."""
+    """Group filenames by shared feature prefix, with directory fallback.
+
+    Strategy:
+    1. Group by prefix (keyword-based, handles SPEC-X, IR-X, SOP-X patterns)
+    2. If too many orphans, fall back to directory-based grouping
+    3. If still over MAX_FEATURES, merge smallest orphans into a misc group
+    """
     if not filenames:
         return {}
 
@@ -55,19 +64,18 @@ def group_by_feature(filenames: list[str]) -> dict[str, list[str]]:
     first_token_groups: dict[str, list[str]] = {}
     for filename in filenames:
         name = name_map[filename]
-        first_token = name.split("-")[0]
+        # Split on both hyphens and underscores for broader matching
+        first_token = re.split(r"[-_]", name)[0]
         first_token_groups.setdefault(first_token, []).append(filename)
 
     # Step 2: determine feature key per first-token group
     groups: dict[str, list[str]] = {}
     for first_token, group_files in first_token_groups.items():
         if len(group_files) == 1:
-            # Orphan: use first token as key
             feature = first_token
         else:
-            # Multiple files: use longest common prefix (segment-level)
             names = [name_map[f] for f in group_files]
-            split_names = [n.split("-") for n in names]
+            split_names = [re.split(r"[-_]", n) for n in names]
             min_len = min(len(parts) for parts in split_names)
             common_len = 0
             for i in range(min_len):
@@ -77,6 +85,39 @@ def group_by_feature(filenames: list[str]) -> dict[str, list[str]]:
                     break
             feature = "-".join(split_names[0][:common_len]) if common_len > 0 else first_token
         groups.setdefault(feature, []).extend(group_files)
+
+    # Step 3: Directory-based fallback for orphan files (groups with 1 file)
+    if len(groups) > MAX_FEATURES:
+        orphan_features = [k for k, v in groups.items() if len(v) == 1]
+        if orphan_features:
+            # Re-group orphans by parent directory
+            dir_groups: dict[str, list[str]] = {}
+            for feature in orphan_features:
+                filename = groups[feature][0]
+                parent = os.path.dirname(filename)
+                dir_name = os.path.basename(parent) if parent else "root"
+                dir_key = f"dir-{dir_name}" if dir_name != "root" else "misc"
+                dir_groups.setdefault(dir_key, []).append(filename)
+
+            # Remove orphans from groups, add directory groups
+            for feature in orphan_features:
+                del groups[feature]
+            for dir_key, dir_files in dir_groups.items():
+                groups.setdefault(dir_key, []).extend(dir_files)
+
+            logger.info(f"Directory fallback: merged {len(orphan_features)} orphans into {len(dir_groups)} directory groups")
+
+    # Step 4: If still over limit, merge smallest groups into "misc"
+    if len(groups) > MAX_FEATURES:
+        sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]))
+        misc_files = []
+        while len(groups) > MAX_FEATURES - 1:  # -1 to leave room for misc
+            feature, files = sorted_groups.pop(0)
+            misc_files.extend(files)
+            del groups[feature]
+        if misc_files:
+            groups["misc"] = misc_files
+            logger.info(f"Merged {len(misc_files)} files into 'misc' group to stay under {MAX_FEATURES} features")
 
     return groups
 
