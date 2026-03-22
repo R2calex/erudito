@@ -518,7 +518,7 @@ async def classify_endpoint(dry_run: bool = Query(default=True)):
 
     from core.classifier import classify_inbox, move_classified
 
-    inbox_path = os.path.expanduser("~/desarrollos_openclaw/claude_contracts")
+    inbox_path = "/home/r0calex/desarrollos_openclaw/claude_contracts"
 
     classification = classify_inbox(inbox_path)
 
