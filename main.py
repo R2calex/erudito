@@ -504,6 +504,102 @@ async def register_project(data: dict):
     return {"status": "registered", "project": name}
 
 
+# --- Ingest Endpoint (for remote nodes) ---
+
+INGESTED_DIR = os.path.join(DATA_DIR, "ingested")
+
+
+@app.post("/ingest/{project}")
+async def ingest_endpoint(project: str, data: dict):
+    """Ingest documentation files from remote nodes.
+
+    Accepts: {"files": [{"path": "filename.md", "content": "...", "node": "kubo"}]}
+    Stores files in data/ingested/{project}/ for the curator to process.
+    Optionally triggers curation if auto_curate=true.
+    """
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+
+    files = data.get("files", [])
+    if not files:
+        raise HTTPException(400, "No files provided")
+
+    node = data.get("node", "unknown")
+    auto_curate = data.get("auto_curate", False)
+
+    # Store ingested files
+    ingest_dir = Path(INGESTED_DIR) / project
+    ingest_dir.mkdir(parents=True, exist_ok=True)
+
+    stored = 0
+    for f in files:
+        filename = f.get("path") or f.get("filename")
+        content = f.get("content", "")
+        if not filename or not content:
+            continue
+        # Use basename only to avoid path traversal
+        safe_name = os.path.basename(filename)
+        (ingest_dir / safe_name).write_text(content, encoding="utf-8")
+        stored += 1
+
+    audit_log({
+        "action": "ingest",
+        "project": project,
+        "node": node,
+        "files": stored,
+    })
+    logger.info(f"Ingested {stored} files for {project} from {node}")
+
+    # Register project if not exists
+    entry = registry.get(project)
+    if not entry:
+        # Register with ingested path as the project path
+        registry._data["projects"][project] = {
+            **dict(__import__('core.registry', fromlist=['_DEFAULT_ENTRY'])._DEFAULT_ENTRY),
+            "path": str(ingest_dir),
+            "node": node,
+        }
+        registry._persist()
+        logger.info(f"Auto-registered project '{project}' from node {node}")
+
+    # Curate the ingested files directly (they're already .md, no need for scanner)
+    if auto_curate and stored > 0:
+        delta_files = []
+        for md_file in sorted(ingest_dir.glob("*.md")):
+            delta_files.append({
+                "path": md_file.name,
+                "content": md_file.read_text(encoding="utf-8"),
+                "action": "added",
+            })
+
+        curation_result = curate_project(project, str(ingest_dir), delta_files, CURATED_DIR)
+        if curation_result.success:
+            proj = registry._data["projects"].get(project)
+            if proj:
+                proj["curation_status"] = "curated"
+                proj["curated_at"] = _now_iso()
+                proj["curated_files"] = curation_result.curated_files
+                proj["doc_count"] = stored
+                registry._persist()
+
+        return {
+            "status": "ingested_and_curated",
+            "project": project,
+            "node": node,
+            "files_stored": stored,
+            "curated_files": curation_result.curated_files,
+            "features": curation_result.features,
+        }
+
+    return {
+        "status": "ingested",
+        "project": project,
+        "node": node,
+        "files_stored": stored,
+        "message": f"Use POST /curate/{project} to process",
+    }
+
+
 # --- Classify Endpoint ---
 
 @app.post("/classify")
