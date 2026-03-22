@@ -504,6 +504,55 @@ async def register_project(data: dict):
     return {"status": "registered", "project": name}
 
 
+# --- Classify Endpoint ---
+
+@app.post("/classify")
+async def classify_endpoint(dry_run: bool = Query(default=True)):
+    """Classify inbox files and move them to their project directories.
+
+    Reads from claude_contracts, classifies by keyword, moves to {project}/docs/contracts/.
+    Default: dry_run=True (preview only). Set dry_run=false to actually move files.
+    """
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+
+    from core.classifier import classify_inbox, move_classified
+
+    inbox_path = os.path.expanduser("~/desarrollos_openclaw/claude_contracts")
+
+    classification = classify_inbox(inbox_path)
+
+    # Build project_paths from registry
+    project_paths = {}
+    for name in registry.list_all():
+        entry = registry.get(name)
+        if entry and entry.get("path"):
+            project_paths[name] = entry["path"]
+
+    # Move (or preview)
+    result = move_classified(inbox_path, classification, project_paths, dry_run=dry_run)
+
+    audit_log({
+        "action": "classify_dry_run" if dry_run else "classify_move",
+        "classified": {k: len(v) for k, v in result.classified.items()},
+        "unclassified": len(result.unclassified),
+        "moved": result.moved,
+    })
+
+    return {
+        "dry_run": dry_run,
+        "classified": {k: v for k, v in result.classified.items()},
+        "unclassified": result.unclassified,
+        "moved": result.moved,
+        "errors": result.errors,
+        "summary": {
+            "total_files": sum(len(v) for v in result.classified.values()) + len(result.unclassified),
+            "classified": sum(len(v) for v in result.classified.values()),
+            "unclassified": len(result.unclassified),
+        },
+    }
+
+
 # --- Scan Endpoints ---
 
 @app.post("/scan")
