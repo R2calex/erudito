@@ -253,7 +253,7 @@ async def _nlm_sync_project(project_name: str):
     if result["success"]:
         _nlm_call_stats["success"] += 1
         for note in result["notes"]:
-            embedding = embed_text(f"{note['question']} {note['answer']}")
+            embedding = embed_text(f"{note['question']} {note['answer'][:200]}")
             point_id = generate_point_id(f"nlm:{project_name}:{note['question'][:50]}", 0)
             upsert_points([{
                 "id": point_id,
@@ -665,7 +665,7 @@ async def curate_endpoint(project: str):
         # Step 4: Index notes into Qdrant
         indexed = 0
         for note in nlm_result["notes"]:
-            embedding = embed_text(f"{note['question']} {note['answer']}")
+            embedding = embed_text(f"{note['question']} {note['answer'][:200]}")
             point_id = generate_point_id(f"nlm:{project}:{note['question'][:50]}", 0)
             upsert_points([{
                 "id": point_id,
