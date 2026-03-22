@@ -245,18 +245,32 @@ async def add_source(notebook_id: str, content: str, title: str = "") -> bool:
     return result is not None
 
 
+async def get_source_content(source_id: str) -> str | None:
+    """Get raw text content of a source."""
+    result = await _call_mcp("source_get_content", {"source_id": source_id})
+    if result:
+        return result.get("content") or result.get("text") or None
+    return None
+
+
+def _content_hash(text: str) -> str:
+    """Quick hash for content comparison."""
+    import hashlib
+    return hashlib.md5(text.encode()).hexdigest()[:16]
+
+
 async def sync_sources(notebook_id: str, curated_files: list[Path]) -> dict:
-    """Sync curated files to notebook sources. Idempotent.
+    """Sync curated files to notebook sources. Idempotent with content change detection.
 
-    - Lists existing sources
-    - Matches by title (filename)
-    - Deletes sources whose curated file no longer exists
-    - Adds new sources that don't exist yet
-    - Skips sources that already exist (by title match)
+    - Lists existing sources, matches by title (filename)
+    - Deletes sources whose curated file no longer exists (feature removed)
+    - Detects content changes: if title matches but content differs, replaces source
+    - Adds new sources that don't exist yet (new feature)
+    - Skips sources where title matches and content is unchanged
 
-    Returns: {added: int, deleted: int, skipped: int, total: int}
+    Returns: {added: int, deleted: int, updated: int, skipped: int, total: int}
     """
-    stats = {"added": 0, "deleted": 0, "skipped": 0, "total": 0}
+    stats = {"added": 0, "deleted": 0, "updated": 0, "skipped": 0, "total": 0}
 
     existing_sources = await list_sources(notebook_id)
     existing_by_title = {}
@@ -266,7 +280,7 @@ async def sync_sources(notebook_id: str, curated_files: list[Path]) -> dict:
 
     desired_titles = {cf.name for cf in curated_files}
 
-    # Delete sources that no longer exist in curated files
+    # Delete sources whose curated file no longer exists
     for title, src in existing_by_title.items():
         if title and title not in desired_titles:
             src_id = src.get("id") or src.get("source_id")
@@ -276,23 +290,52 @@ async def sync_sources(notebook_id: str, curated_files: list[Path]) -> dict:
                     stats["deleted"] += 1
                     logger.info(f"Deleted stale source '{title}' from notebook")
 
-    # Add new sources or skip existing
+    # Process each curated file
     for cf in curated_files:
+        new_content = cf.read_text(encoding="utf-8")
+
         if cf.name in existing_by_title:
-            stats["skipped"] += 1
-            logger.debug(f"Source '{cf.name}' already exists, skipping")
+            # Source exists — check if content changed
+            src = existing_by_title[cf.name]
+            src_id = src.get("id") or src.get("source_id")
+
+            # Try to get existing content for comparison
+            content_changed = False
+            if src_id:
+                old_content = await get_source_content(src_id)
+                if old_content:
+                    content_changed = _content_hash(old_content) != _content_hash(new_content)
+                else:
+                    # Can't read old content, assume changed to be safe
+                    content_changed = True
+
+            if content_changed:
+                # Delete old + add new (replace)
+                if src_id:
+                    await delete_source(src_id)
+                current_count = len(existing_sources) - stats["deleted"] - stats["updated"] + stats["added"]
+                if current_count >= NLM_SOURCE_LIMIT:
+                    logger.warning(f"Reached source limit ({NLM_SOURCE_LIMIT}), cannot update '{cf.name}'")
+                    continue
+                ok = await add_source(notebook_id, new_content, cf.name)
+                if ok:
+                    stats["updated"] += 1
+                    logger.info(f"Updated source '{cf.name}' (content changed)")
+            else:
+                stats["skipped"] += 1
+                logger.debug(f"Source '{cf.name}' unchanged, skipping")
         else:
-            # Check source limit
+            # New source
             current_count = len(existing_sources) - stats["deleted"] + stats["added"]
             if current_count >= NLM_SOURCE_LIMIT:
                 logger.warning(f"Reached source limit ({NLM_SOURCE_LIMIT}), cannot add '{cf.name}'")
                 break
-            content = cf.read_text(encoding="utf-8")
-            ok = await add_source(notebook_id, content, cf.name)
+            ok = await add_source(notebook_id, new_content, cf.name)
             if ok:
                 stats["added"] += 1
+                logger.info(f"Added new source '{cf.name}'")
 
-    stats["total"] = len(existing_sources) - stats["deleted"] + stats["added"]
+    stats["total"] = len(existing_sources) - stats["deleted"] + stats["added"] + stats["updated"]
     return stats
 
 
@@ -382,20 +425,20 @@ async def run_nlm_cycle(
         f"skipped={sync_stats['skipped']}, total={sync_stats['total']}"
     )
 
-    # 2. Wait for NLM to process new sources (only if sources were added)
-    if sync_stats["added"] > 0:
+    result["sync_stats"] = sync_stats
+
+    # 2. Wait for NLM to process new/updated sources
+    if sync_stats["added"] > 0 or sync_stats.get("updated", 0) > 0:
         await asyncio.sleep(20)
 
-    # 3. Condense
-    condensed = await query_notebook(
-        notebook_id,
-        "Condense all the information from the sources into a comprehensive summary."
-    )
-    if condensed:
+    # 3. Project summary question
+    summary_q = f"Explain what {project_name} is and what it consists of?" if project_name else "Explain what this project is and what it consists of?"
+    summary = await query_notebook(notebook_id, summary_q)
+    if summary:
         result["notes"].append({
-            "type": "condensed",
-            "question": "Condense all sources",
-            "answer": condensed,
+            "type": "summary",
+            "question": summary_q,
+            "answer": summary,
             "project": project_name,
         })
 

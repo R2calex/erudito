@@ -522,6 +522,149 @@ async def scan_project(project: str):
     return {"status": "scan_started", "project": project}
 
 
+# --- Curate Endpoint ---
+
+@app.post("/curate/{project}")
+async def curate_endpoint(project: str):
+    """Full curation pipeline: scan → curate → NLM sync → Qdrant index.
+
+    Runs synchronously. Returns detailed results of each step.
+    """
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    entry = registry.get(project)
+    if not entry:
+        raise HTTPException(404, f"Project '{project}' not found")
+
+    result = {
+        "project": project,
+        "steps": {},
+    }
+
+    repo_path = os.path.expanduser(entry["path"])
+    if not os.path.isdir(repo_path):
+        raise HTTPException(400, f"Path not found: {repo_path}")
+
+    # Step 1: Scan for delta
+    delta = compute_delta(project, repo_path, entry.get("last_hash"))
+    if delta:
+        # Sanitize
+        for file_info in delta["files"]:
+            if file_info["content"]:
+                san = await sanitize_text(file_info["content"])
+                file_info["content"] = san["sanitized"]
+
+        result["steps"]["scan"] = {"files": len(delta["files"]), "status": "delta_detected"}
+    else:
+        result["steps"]["scan"] = {"files": 0, "status": "no_changes"}
+
+    # Step 2: Curate (always run even without delta — uses existing files)
+    if delta:
+        curation_result = curate_project(project, repo_path, delta["files"], CURATED_DIR)
+        proj = registry._data["projects"].get(project)
+        if proj and curation_result.success:
+            proj["curation_status"] = "curated"
+            proj["curated_at"] = _now_iso()
+            proj["curated_files"] = curation_result.curated_files
+            registry._persist()
+            if delta:
+                registry.update_sync(project, delta["new_hash"],
+                                     doc_count=len([f for f in delta["files"] if f["action"] != "deleted"]))
+        result["steps"]["curate"] = {
+            "status": "ok" if curation_result.success else "error",
+            "curated_files": curation_result.curated_files,
+            "features": curation_result.features,
+            "errors": curation_result.errors,
+        }
+        audit_log({"action": "curation_complete", "project": project,
+                   "features": curation_result.features, "curated_files": curation_result.curated_files})
+    else:
+        # Check if curated files already exist
+        curated_dir = Path(CURATED_DIR) / project
+        existing = list(curated_dir.glob("*.md")) if curated_dir.is_dir() else []
+        result["steps"]["curate"] = {
+            "status": "skipped_no_delta",
+            "existing_curated_files": len(existing),
+        }
+
+    # Step 3: NLM sync
+    curated_dir = os.path.join(CURATED_DIR, project)
+    curated_path = Path(curated_dir)
+    if not curated_path.is_dir() or not list(curated_path.glob("*.md")):
+        result["steps"]["nlm"] = {"status": "skipped_no_curated_files"}
+        return result
+
+    # Ensure notebook
+    notebook_id = entry.get("notebook_id")
+    if not notebook_id:
+        notebook_id = await nlm.ensure_notebook(f"AI-Lab: {project}")
+        if notebook_id:
+            registry._data["projects"][project]["notebook_id"] = notebook_id
+            registry._persist()
+
+    if not notebook_id:
+        result["steps"]["nlm"] = {"status": "error", "message": "Failed to create/find notebook"}
+        return result
+
+    # Run NLM cycle
+    _nlm_call_stats["total"] += 1
+    nlm_result = await nlm.run_nlm_cycle(notebook_id, curated_dir, project_name=project)
+
+    if nlm_result["success"]:
+        _nlm_call_stats["success"] += 1
+
+        # Step 4: Index notes into Qdrant
+        indexed = 0
+        for note in nlm_result["notes"]:
+            embedding = embed_text(f"{note['question']} {note['answer']}")
+            point_id = generate_point_id(f"nlm:{project}:{note['question'][:50]}", 0)
+            upsert_points([{
+                "id": point_id,
+                "vector": embedding,
+                "payload": {
+                    "text": note["answer"],
+                    "question": note["question"],
+                    "source": f"nlm:{project}",
+                    "project": project,
+                    "from_nlm": True,
+                    "type": note["type"],
+                    "chunk_index": 0,
+                },
+            }], COLLECTION_NLM_NOTES)
+            indexed += 1
+
+        # Update registry
+        proj = registry._data["projects"].get(project)
+        if proj:
+            proj["nlm_source_count"] = nlm_result.get("sources_uploaded", 0)
+            proj["nlm_consecutive_failures"] = 0
+            proj["status"] = "validated"
+            proj["coverage"] = 1.0
+            proj["last_nlm_session"] = _now_iso()
+            registry._persist()
+
+        result["steps"]["nlm"] = {
+            "status": "ok",
+            "notebook_id": notebook_id,
+            "sources_uploaded": nlm_result.get("sources_uploaded", 0),
+            "sync_stats": nlm_result.get("sync_stats", {}),
+            "notes_generated": len(nlm_result["notes"]),
+        }
+        result["steps"]["qdrant"] = {"status": "ok", "indexed": indexed}
+
+        audit_log({"action": "nlm_validated", "project": project, "notes": len(nlm_result["notes"])})
+    else:
+        proj = registry._data["projects"].get(project)
+        if proj:
+            proj["nlm_consecutive_failures"] = proj.get("nlm_consecutive_failures", 0) + 1
+            registry._persist()
+        result["steps"]["nlm"] = {"status": "error", "message": "NLM cycle failed"}
+        audit_log({"action": "nlm_failed", "project": project})
+
+    result["status"] = "validated" if nlm_result["success"] else "partial"
+    return result
+
+
 # --- Search Endpoint ---
 
 @app.get("/search")
