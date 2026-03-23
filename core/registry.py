@@ -189,6 +189,27 @@ class Registry:
         project["status"] = "stale"
         self._persist()
 
+    def update_fields(self, name: str, **fields):
+        """Thread-safe update of arbitrary fields on a project entry."""
+        with self._lock:
+            project = self._data["projects"].get(name)
+            if not project:
+                raise KeyError(f"Project '{name}' not found")
+            project.update(fields)
+            self._data["version"] += 1
+            self._save_yaml()
+            self._save_redis()
+
+    def register_remote(self, name: str, path: str, node: str):
+        """Register a remote project (from satellite node). No path/git validation."""
+        projects = self._data["projects"]
+        if name not in projects:
+            entry = dict(_DEFAULT_ENTRY)
+            entry["path"] = path
+            entry["node"] = node
+            projects[name] = entry
+            self._persist()
+
     def list_all(self) -> list[str]:
         return list(self._data["projects"].keys())
 
