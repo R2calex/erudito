@@ -505,12 +505,34 @@ async def health():
         except Exception:
             pass
 
+    nlm_circuit = nlm.circuit_status()
+
     return {
         "status": "ok" if qdrant_ok else "degraded",
         "version": "3.0.0",
         "qdrant": "up" if qdrant_ok else "down",
         "redis": "up" if redis_ok else "down",
         "projects": len(registry.list_all()) if registry else 0,
+        "nlm_circuit": "open (rate limited)" if nlm_circuit["tripped"] else "closed (ok)",
+    }
+
+
+@app.post("/nlm/reset")
+async def reset_nlm_circuit():
+    """Manually reset the NLM circuit breaker after rate limit recovery."""
+    nlm.reset_circuit()
+    return {"status": "ok", "nlm_circuit": "closed"}
+
+
+@app.get("/nlm/status")
+async def nlm_status():
+    """Get NLM circuit breaker status."""
+    status = nlm.circuit_status()
+    return {
+        "tripped": status["tripped"],
+        "tripped_at": str(status["tripped_at"]) if status["tripped_at"] else None,
+        "reason": status["reason"],
+        "cooldown_hours": nlm.NLM_COOLDOWN_HOURS,
     }
 
 

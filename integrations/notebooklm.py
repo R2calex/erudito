@@ -22,6 +22,14 @@ NLM_MCP_URL = os.getenv("NLM_MCP_URL", "http://notebooklm-mcp:8765/mcp")
 MCP_ENDPOINT = NLM_MCP_URL
 NLM_TIMEOUT = 120.0  # seconds (increased for source_add with wait=True)
 NLM_SOURCE_LIMIT = 50
+NLM_COOLDOWN_HOURS = int(os.getenv("NLM_COOLDOWN_HOURS", "6"))
+
+# Circuit breaker: stop calling NLM after rate limit until cooldown expires
+_circuit_breaker = {
+    "tripped": False,
+    "tripped_at": None,
+    "reason": None,
+}
 
 FIXED_QUESTIONS = [
     "What changes have occurred since the last session?",
@@ -127,8 +135,52 @@ async def _ensure_session(client: httpx.AsyncClient) -> bool:
         return False
 
 
+def is_circuit_open() -> bool:
+    """Check if circuit breaker is tripped. Auto-resets after cooldown."""
+    if not _circuit_breaker["tripped"]:
+        return False
+    from datetime import datetime, timezone
+    tripped_at = _circuit_breaker["tripped_at"]
+    if tripped_at:
+        elapsed = (datetime.now(timezone.utc) - tripped_at).total_seconds() / 3600
+        if elapsed >= NLM_COOLDOWN_HOURS:
+            _circuit_breaker["tripped"] = False
+            _circuit_breaker["tripped_at"] = None
+            _circuit_breaker["reason"] = None
+            logger.info(f"NLM circuit breaker reset after {elapsed:.1f}h cooldown")
+            return False
+    return True
+
+
+def trip_circuit(reason: str):
+    """Trip the circuit breaker — stops all NLM calls until cooldown."""
+    from datetime import datetime, timezone
+    _circuit_breaker["tripped"] = True
+    _circuit_breaker["tripped_at"] = datetime.now(timezone.utc)
+    _circuit_breaker["reason"] = reason
+    logger.warning(f"NLM circuit breaker TRIPPED: {reason}. Cooldown: {NLM_COOLDOWN_HOURS}h")
+
+
+def reset_circuit():
+    """Manually reset the circuit breaker."""
+    _circuit_breaker["tripped"] = False
+    _circuit_breaker["tripped_at"] = None
+    _circuit_breaker["reason"] = None
+    logger.info("NLM circuit breaker manually reset")
+
+
+def circuit_status() -> dict:
+    """Get circuit breaker status."""
+    return dict(_circuit_breaker)
+
+
 async def _call_mcp(tool_name: str, arguments: dict) -> dict | None:
     """Call a NotebookLM MCP tool directly. Returns parsed result or None."""
+    # Circuit breaker: don't call NLM if rate limited
+    if is_circuit_open():
+        logger.debug(f"NLM circuit open, skipping {tool_name}")
+        return None
+
     request = build_mcp_request(tool_name, arguments)
     headers = {
         "Content-Type": "application/json",
@@ -147,7 +199,14 @@ async def _call_mcp(tool_name: str, arguments: dict) -> dict | None:
             resp.raise_for_status()
             raw = _parse_sse_response(resp.text)
             if raw:
-                return parse_mcp_response(raw)
+                result = parse_mcp_response(raw)
+                # Check if NLM returned a rate limit error
+                if result and isinstance(result, dict):
+                    text = result.get("text") or result.get("error") or ""
+                    if "RESOURCE_EXHAUSTED" in str(text):
+                        trip_circuit("RESOURCE_EXHAUSTED from Google")
+                        return None
+                return result
     except Exception as e:
         logger.warning(f"NLM MCP call failed ({tool_name}): {e}")
         global _session_initialized
