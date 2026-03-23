@@ -1,18 +1,103 @@
-"""Search + confidence routing with NotebookLM escalation.
+"""Search + confidence routing with registry-first detection and dual-source mode.
 
-Searches both agent_knowledge and nlm_notes collections.
-Routes to NotebookLM when confidence is below threshold (0.75).
+Routes: registry queries → registry direct, dual mode → Qdrant + NLM live,
+default → nlm_notes only.
 """
 import logging
 import os
+import re
 from typing import Optional
 
-from core.indexer import embed_text, search, upsert_points, generate_point_id, COLLECTION_KNOWLEDGE, COLLECTION_NLM_NOTES
+from core.indexer import embed_text, search, upsert_points, generate_point_id, COLLECTION_NLM_NOTES
 
 logger = logging.getLogger("erudito.query")
 
 CONFIDENCE_THRESHOLD = float(os.getenv("ERUDITO_CONFIDENCE_THRESHOLD", "0.75"))
 NLM_SCORE_BOOST = 0.05
+
+# Registry intent keywords — if query matches, answer from registry not Qdrant
+_REGISTRY_PATTERNS = [
+    (re.compile(r"\b(where|path|location|ubicad|located)\b.*\b(project|proyecto)\b", re.I), "path"),
+    (re.compile(r"\b(which|what)\s+node\b", re.I), "node"),
+    (re.compile(r"\bnotebook.?id\b", re.I), "notebook_id"),
+    (re.compile(r"\b(status|estado)\b.*\b(project|proyecto)\b", re.I), "status"),
+    (re.compile(r"\b(how many|cuantos)\s+(docs|documents|archivos)\b", re.I), "doc_count"),
+    (re.compile(r"\bcuration.?(status|estado)\b", re.I), "curation_status"),
+    (re.compile(r"\b(list|listar)\s+(all\s+)?(projects|proyectos)\b", re.I), "_list_all"),
+]
+
+
+def detect_registry_intent(query: str) -> str | None:
+    """Detect if query can be answered from registry. Returns field name or None."""
+    for pattern, field in _REGISTRY_PATTERNS:
+        if pattern.search(query):
+            return field
+    return None
+
+
+def answer_from_registry(query: str, field: str, registry, project: str | None = None) -> dict | None:
+    """Answer a query directly from registry data."""
+    if field == "_list_all":
+        projects = {}
+        for name in registry.list_all():
+            entry = registry.get(name)
+            if entry:
+                projects[name] = {
+                    "path": entry.get("path"),
+                    "node": entry.get("node"),
+                    "status": entry.get("status"),
+                    "curation_status": entry.get("curation_status"),
+                }
+        return {
+            "answer": projects,
+            "confidence": "high",
+            "sources": [{"type": "registry", "project": "", "file": "registry.yaml", "score": 1.0}],
+            "project_identified": None,
+            "nlm_consulted": False,
+            "suggestion": None,
+            "source_type": "registry",
+        }
+
+    # Try to identify project from query
+    if not project and registry:
+        query_lower = query.lower()
+        for name in registry.list_all():
+            if name.lower() in query_lower:
+                project = name
+                break
+
+    if not project:
+        return None
+
+    entry = registry.get(project)
+    if not entry:
+        return None
+
+    value = entry.get(field)
+    if field == "path":
+        answer = f"Project '{project}' is located at {value} on node {entry.get('node', 'unknown')}"
+    elif field == "node":
+        answer = f"Project '{project}' runs on node {entry.get('node', 'unknown')} at path {entry.get('path', 'unknown')}"
+    elif field == "notebook_id":
+        answer = f"Project '{project}' has NotebookLM notebook ID: {value or 'none (not yet synced)'}"
+    elif field == "status":
+        answer = f"Project '{project}' status: {entry.get('status')}, curation: {entry.get('curation_status', 'unknown')}"
+    elif field == "doc_count":
+        answer = f"Project '{project}' has {entry.get('doc_count', 0)} documents, {entry.get('curated_files', 0)} curated features"
+    elif field == "curation_status":
+        answer = f"Project '{project}' curation status: {entry.get('curation_status', 'unknown')}, curated at: {entry.get('curated_at', 'never')}"
+    else:
+        answer = str(value)
+
+    return {
+        "answer": answer,
+        "confidence": "high",
+        "sources": [{"type": "registry", "project": project, "file": "registry.yaml", "score": 1.0}],
+        "project_identified": project,
+        "nlm_consulted": False,
+        "suggestion": None,
+        "source_type": "registry",
+    }
 
 
 def classify_confidence(score: float) -> str:
@@ -49,7 +134,6 @@ def build_response(
         answer = nlm_answer
         confidence = "medium" if confidence == "low" else confidence
     else:
-        # Compose answer from top sources
         top_texts = [s["payload"].get("text", "") for s in sources[:3]]
         answer = "\n\n".join(top_texts)
 
@@ -79,37 +163,41 @@ async def execute_query(
     top_k: int = 5,
     nlm_client=None,
     registry=None,
+    mode: str = "default",
 ) -> dict:
     """Execute a query with confidence routing.
 
-    1. Search Qdrant (both collections)
-    2. If high confidence → respond directly
-    3. If low confidence + notebook available → consult NotebookLM
-    4. If nothing → "I don't know"
+    Modes:
+    - "default": registry-first, then nlm_notes search
+    - "dual": returns both Qdrant answer and NLM live answer as array
     """
-    query_embedding = embed_text(query)
+    # Route 1: Registry queries (exact data)
+    if registry:
+        intent = detect_registry_intent(query)
+        if intent:
+            result = answer_from_registry(query, intent, registry, project)
+            if result:
+                return result
 
-    # Search both collections
-    knowledge_results = search(query_embedding, COLLECTION_KNOWLEDGE, top_k, project)
+    # Route 2: Dual mode (Qdrant + NLM live)
+    if mode == "dual":
+        return await _execute_dual(query, project, top_k, nlm_client, registry)
+
+    # Route 3: Default search (nlm_notes only)
+    query_embedding = embed_text(query)
     nlm_results = search(query_embedding, COLLECTION_NLM_NOTES, top_k, project)
 
-    # Boost nlm_notes scores and mark them
     for r in nlm_results:
-        r["score"] = min(r["score"] + NLM_SCORE_BOOST, 1.0)
         r["payload"]["from_nlm"] = True
 
-    # Combine and sort
-    all_results = knowledge_results + nlm_results
-    all_results.sort(key=lambda x: x["score"], reverse=True)
-    top_results = all_results[:top_k]
-
+    top_results = nlm_results[:top_k]
     best_score = top_results[0]["score"] if top_results else 0.0
 
     # High confidence → respond directly
     if best_score >= CONFIDENCE_THRESHOLD:
         return build_response(query, top_results, project_identified=project)
 
-    # Low confidence → try NotebookLM if available
+    # Low confidence → try NLM live if available
     notebook_id = None
     if project and registry:
         entry = registry.get(project)
@@ -120,8 +208,7 @@ async def execute_query(
         try:
             nlm_answer = await nlm_client.query_notebook(notebook_id, query)
             if nlm_answer:
-                # Save to Qdrant for future queries
-                note_embedding = embed_text(nlm_answer)
+                note_embedding = embed_text(f"{query} {nlm_answer[:200]}")
                 point_id = generate_point_id(f"nlm_live:{project}:{query[:50]}", 0)
                 upsert_points([{
                     "id": point_id,
@@ -144,5 +231,59 @@ async def execute_query(
         except Exception as e:
             logger.warning(f"NLM query failed: {e}")
 
-    # Respond with what we have
     return build_response(query, top_results, nlm_consulted=False, project_identified=project)
+
+
+async def _execute_dual(
+    query: str,
+    project: str | None,
+    top_k: int,
+    nlm_client,
+    registry,
+) -> dict:
+    """Dual-source mode: returns Qdrant answer + NLM live answer."""
+    # Qdrant search
+    query_embedding = embed_text(query)
+    nlm_results = search(query_embedding, COLLECTION_NLM_NOTES, top_k, project)
+
+    qdrant_answer = {
+        "answer": "\n\n".join(r["payload"].get("text", "") for r in nlm_results[:3]) if nlm_results else "No results in Qdrant",
+        "confidence": classify_confidence(nlm_results[0]["score"] if nlm_results else 0.0),
+        "sources": [
+            {
+                "type": "nlm_note",
+                "project": r["payload"].get("project", ""),
+                "score": round(r["score"], 4),
+            }
+            for r in nlm_results[:5]
+        ],
+    }
+
+    # NLM live query
+    nlm_live_answer = {"answer": None, "notebook_id": None, "source": "notebooklm"}
+    notebook_id = None
+    if project and registry:
+        entry = registry.get(project)
+        if entry:
+            notebook_id = entry.get("notebook_id")
+
+    if notebook_id and nlm_client:
+        try:
+            answer = await nlm_client.query_notebook(notebook_id, query)
+            nlm_live_answer = {
+                "answer": answer,
+                "notebook_id": notebook_id,
+                "source": "notebooklm",
+            }
+        except Exception as e:
+            nlm_live_answer["answer"] = f"NLM query failed: {e}"
+    elif not notebook_id:
+        nlm_live_answer["answer"] = "No notebook available for this project"
+
+    return {
+        "mode": "dual",
+        "query": query,
+        "project_identified": project,
+        "qdrant": qdrant_answer,
+        "nlm_live": nlm_live_answer,
+    }

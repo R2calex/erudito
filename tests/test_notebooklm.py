@@ -49,8 +49,8 @@ class TestMCPProtocol:
 
 
 class TestFixedQuestions:
-    def test_has_five_questions(self):
-        assert len(FIXED_QUESTIONS) == 5
+    def test_has_eight_questions(self):
+        assert len(FIXED_QUESTIONS) == 8
 
     def test_questions_are_strings(self):
         for q in FIXED_QUESTIONS:

@@ -925,6 +925,7 @@ async def search_endpoint(
     q: str = Query(..., min_length=1),
     project: str | None = Query(default=None),
     top_k: int = Query(default=5, ge=1, le=50),
+    mode: str = Query(default="default", regex="^(default|dual)$"),
 ):
     _query_stats["total"] += 1
     result = await execute_query(
@@ -933,7 +934,8 @@ async def search_endpoint(
         top_k=top_k,
         nlm_client=nlm,
         registry=registry,
+        mode=mode,
     )
-    if result["confidence"] == "high":
+    if result.get("confidence") == "high":
         _query_stats["high"] += 1
     return result

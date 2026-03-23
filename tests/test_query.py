@@ -1,5 +1,5 @@
 import pytest
-from core.query import classify_confidence, build_response, NLM_SCORE_BOOST
+from core.query import classify_confidence, build_response, NLM_SCORE_BOOST, detect_registry_intent
 
 
 class TestConfidenceClassification:
@@ -36,3 +36,26 @@ class TestBuildResponse:
         resp = build_response("Random question", [], nlm_consulted=False)
         assert resp["confidence"] == "low"
         assert "don't have" in resp["answer"].lower() or "no information" in resp["answer"].lower()
+
+
+class TestRegistryIntent:
+    def test_path_query(self):
+        assert detect_registry_intent("Where is the erudito project located?") == "path"
+
+    def test_node_query(self):
+        assert detect_registry_intent("Which node runs infra-mcp?") == "node"
+
+    def test_notebook_id_query(self):
+        assert detect_registry_intent("What is the notebook_id for erudito?") == "notebook_id"
+
+    def test_status_query(self):
+        assert detect_registry_intent("What is the status of project jasper?") == "status"
+
+    def test_list_all(self):
+        assert detect_registry_intent("List all projects") == "_list_all"
+
+    def test_no_intent(self):
+        assert detect_registry_intent("How does the curator work?") is None
+
+    def test_curation_status(self):
+        assert detect_registry_intent("What is the curation_status of erudito?") == "curation_status"

@@ -29,6 +29,9 @@ FIXED_QUESTIONS = [
     "What new resources have been registered for this project?",
     "On which AI-Lab node is this project running?",
     "What is the current project status according to documentation?",
+    "How should other agents and nodes in the AI-Lab mesh use this project?",
+    "What are the most common operational issues and how to troubleshoot them?",
+    "Where is this project located (path, node, repository)?",
 ]
 
 _REQUEST_ID = 0
