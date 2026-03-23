@@ -62,6 +62,17 @@ _last_scan_time: str | None = None
 _auto_enriched_files: int = 0
 _total_scanned_files: int = 0
 
+# Error patterns that indicate NLM returned garbage instead of real answers
+_NLM_ERROR_PATTERNS = ["RESOURCE_EXHAUSTED", "error code", "status': 'error", "Google rejected"]
+
+
+def _is_nlm_error(answer: str) -> bool:
+    """Check if an NLM answer is actually an error response, not real knowledge."""
+    if not answer:
+        return True
+    answer_start = str(answer)[:200]
+    return any(p in answer_start for p in _NLM_ERROR_PATTERNS)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -363,6 +374,10 @@ async def _nlm_sync_project(project_name: str):
     if result["success"]:
         _nlm_call_stats["success"] += 1
         for note in result["notes"]:
+            # Guardrail: never index NLM error responses as knowledge
+            if _is_nlm_error(note.get("answer", "")):
+                logger.warning(f"Skipping contaminated NLM response for {project_name}: {note.get('question', '')[:50]}")
+                continue
             embedding = embed_text(f"{note['question']} {note['answer'][:200]}")
             point_id = generate_point_id(f"nlm:{project_name}:{note['question'][:50]}", 0)
             upsert_points([{
@@ -866,9 +881,12 @@ async def curate_endpoint(project: str):
     if nlm_result["success"]:
         _nlm_call_stats["success"] += 1
 
-        # Step 4: Index notes into Qdrant
+        # Step 4: Index notes into Qdrant (skip error responses)
         indexed = 0
         for note in nlm_result["notes"]:
+            if _is_nlm_error(note.get("answer", "")):
+                logger.warning(f"Skipping contaminated NLM response for {project}: {note.get('question', '')[:50]}")
+                continue
             embedding = embed_text(f"{note['question']} {note['answer'][:200]}")
             point_id = generate_point_id(f"nlm:{project}:{note['question'][:50]}", 0)
             upsert_points([{
