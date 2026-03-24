@@ -573,14 +573,21 @@ async def _distill_nlm(project_name: str, curated_dir: str):
             }], collection=COLLECTION_NLM_NOTES)
             indexed += 1
 
-        registry.update_fields(
-            project_name,
-            nlm_baseline=True,
-            last_distill=_now_iso(),
-            last_nlm_distill=_now_iso(),
-            nlm_consecutive_failures=0,
-            status="synced",
-        )
+        if indexed > 0:
+            registry.update_fields(
+                project_name,
+                nlm_baseline=True,
+                last_distill=_now_iso(),
+                last_nlm_distill=_now_iso(),
+                nlm_consecutive_failures=0,
+                status="synced",
+            )
+        else:
+            logger.warning(f"NLM returned success but all notes filtered for {project_name}")
+            registry.update_fields(
+                project_name,
+                nlm_consecutive_failures=entry.get("nlm_consecutive_failures", 0) + 1,
+            )
         audit_log({"action": "distill_nlm", "project": project_name, "notes": indexed})
     else:
         registry.update_fields(
@@ -627,6 +634,12 @@ async def _distill_llm(project_name: str, curated_dir: str, nlm_notes: list[dict
     except Exception as e:
         logger.error(f"LLM distill failed for {project_name}: {e}")
         audit_log({"action": "distill_llm_error", "project": project_name, "error": str(e)})
+        return
+
+    # Guard against error responses from LLM gateway
+    if _is_nlm_error(raw_answer):
+        logger.warning(f"LLM returned error response for {project_name}: {raw_answer[:100]}")
+        audit_log({"action": "distill_llm_error_response", "project": project_name})
         return
 
     notes = parse_llm_response(raw_answer, project_name)

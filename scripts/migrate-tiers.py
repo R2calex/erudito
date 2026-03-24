@@ -65,25 +65,36 @@ def main():
         print("\n=== Migrating Qdrant nlm_notes payloads ===")
         try:
             from core.indexer import _qdrant_request, COLLECTION_NLM_NOTES
-            scroll_body = {"limit": 100, "with_payload": True}
-            result = _qdrant_request(
-                f"/collections/{COLLECTION_NLM_NOTES}/points/scroll",
-                data=scroll_body,
-            )
-            points = result.get("result", {}).get("points", [])
             migrated = 0
-            for point in points:
-                payload = point.get("payload", {})
-                if payload.get("from_nlm") and not payload.get("distill_source"):
-                    _qdrant_request(
-                        f"/collections/{COLLECTION_NLM_NOTES}/points/payload",
-                        data={
-                            "points": [point["id"]],
-                            "payload": {"distill_source": "nlm", "canonical": True},
-                        },
-                        method="POST",
-                    )
-                    migrated += 1
+            offset = None  # Qdrant scroll pagination
+            while True:
+                scroll_body = {"limit": 100, "with_payload": True}
+                if offset is not None:
+                    scroll_body["offset"] = offset
+                result = _qdrant_request(
+                    f"/collections/{COLLECTION_NLM_NOTES}/points/scroll",
+                    data=scroll_body,
+                )
+                points = result.get("result", {}).get("points", [])
+                next_offset = result.get("result", {}).get("next_page_offset")
+
+                for point in points:
+                    payload = point.get("payload", {})
+                    if payload.get("from_nlm") and not payload.get("distill_source"):
+                        _qdrant_request(
+                            f"/collections/{COLLECTION_NLM_NOTES}/points/payload",
+                            data={
+                                "points": [point["id"]],
+                                "payload": {"distill_source": "nlm", "canonical": True},
+                            },
+                            method="PUT",
+                        )
+                        migrated += 1
+
+                if not next_offset or not points:
+                    break
+                offset = next_offset
+
             print(f"  Migrated {migrated} points (added distill_source='nlm')")
         except Exception as e:
             print(f"  WARNING: Qdrant migration failed: {e}")

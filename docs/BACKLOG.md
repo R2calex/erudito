@@ -24,7 +24,7 @@
 - [ ] **`NLM_SCORE_BOOST` dead code**: Remove or implement in query engine. (review #12)
 - [ ] **SSE multi-line parsing**: Handle streaming responses with multiple data lines. (review #13)
 - [ ] **Test coverage**: Add unit tests for execute_query, answer_from_registry, circuit breaker, _pull_remote_docs, _distill_llm, _distill_direct, _distill_nlm. (review #18)
-- [ ] **LLM response validation**: Add `_is_nlm_error` check to `_distill_llm` raw response before parsing. (review #20)
+- [x] **LLM response validation**: ~~Add `_is_nlm_error` check to `_distill_llm`~~ — Done, guards against error responses from LLM gateway.
 - [ ] **Rate limiter on /search**: Prevent Ollama/NLM overload from burst requests. (review #16)
 - [ ] **push-docs.sh filename escaping**: Escape `$BASENAME` through json.dumps. (review #17)
 - [ ] **Register endpoint for remote projects**: Allow POST /registry without path/git validation when node != hanzo. (review #15)

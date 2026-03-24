@@ -262,17 +262,80 @@ print(f'Status: {d[\"result\"][\"status\"]}')
 
 If count is 0 after a scan, check the audit trail for `skip_poison` or `embed_error` entries.
 
-## 10. Run Tests
+## 10. Knowledge Tier Operations (v3)
+
+### Check tier distribution
+```bash
+curl -s http://localhost:8095/metrics | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+t = d.get('tiers', {})
+print(f'Tier distribution: {t.get(\"distribution\", {})}')
+print(f'NLM baselines: {t.get(\"nlm_baseline_count\", 0)}')
+"
+```
+
+### Curate a project (respects tiers)
+```bash
+# Normal curation (uses tier-appropriate backend)
+curl -s -X POST http://localhost:8095/curate/erudito | python3 -m json.tool
+
+# Force NLM re-sync (for major changes like new SPECs)
+curl -s -X POST "http://localhost:8095/curate/jasper?force_nlm=true" | python3 -m json.tool
+```
+
+### Override a project's tier
+```bash
+# Set manual tier (1=NLM, 2=LLM, 3=Direct)
+curl -s -X POST http://localhost:8095/registry \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-project", "tier": 1}'
+```
+
+### Run tier migration (one-time)
+```bash
+cd ~/ai-lab/erudito
+
+# Preview tier assignments
+python scripts/migrate-tiers.py --dry-run
+
+# Apply (backs up registry first)
+python scripts/migrate-tiers.py
+```
+
+### Consumer feedback
+```bash
+# Report feedback (agents do this automatically)
+curl -s -X POST http://localhost:8095/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"project": "jasper", "query": "what is jasper?", "useful": true, "coherent": true, "logical": true}'
+
+# Check feedback metrics
+curl -s http://localhost:8095/metrics | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for p, s in d.get('feedback', {}).items():
+    flag = ' *** NEEDS REVIEW ***' if s.get('needs_review') else ''
+    print(f'{p}: useful={s[\"useful_pct\"]}% coherent={s[\"coherent_pct\"]}% logical={s[\"logical_pct\"]}%{flag}')
+"
+```
+
+### Daily cron (tier-aware)
+```bash
+# Only Tier 1 projects go to NLM, Tier 2/3 processed immediately
+./scripts/cleanup-and-recurate.sh
+```
+
+## 11. Run Tests
 
 ```bash
 cd ~/ai-lab/erudito
 
-# Unit tests only (no services needed, always safe)
-pytest tests/test_erudito.py -m "not network and not integration" -v
+# All unit tests (no services needed)
+python -m pytest tests/ -v
 
-# With Qdrant + Ollama running
-pytest tests/test_erudito.py --run-network -v
-
-# Full suite (Erudito must be up on :8095)
-pytest tests/test_erudito.py --run-network --run-integration -v
+# Quick check
+python -m pytest tests/ -q
 ```
+
+Expected: 168+ tests passing.
