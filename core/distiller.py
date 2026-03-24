@@ -28,7 +28,8 @@ DISTILL_LLM_TIMEOUT = int(os.getenv("DISTILL_LLM_TIMEOUT", "120"))
 DISTILL_LLM_MAX_TOKENS = int(os.getenv("DISTILL_LLM_MAX_TOKENS", "4000"))
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 
-_ANSWER_RE = re.compile(r"^\d+\.\s*", re.MULTILINE)
+# Only match top-level question numbers (1-5), not sub-lists within answers
+_ANSWER_RE = re.compile(r"^[1-5]\.\s+", re.MULTILINE)
 
 
 def compute_tier(project_name: str, curated_dir: str, registry_entry: dict) -> int:
