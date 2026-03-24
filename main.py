@@ -984,10 +984,11 @@ async def scan_project(project: str):
 # --- Curate Endpoint ---
 
 @app.post("/curate/{project}")
-async def curate_endpoint(project: str):
-    """Full curation pipeline: scan → curate → NLM sync → Qdrant index.
+async def curate_endpoint(project: str, force_nlm: bool = Query(False)):
+    """Full curation pipeline: scan → curate → tier-based distillation → Qdrant index.
 
     Runs synchronously. Returns detailed results of each step.
+    Use force_nlm=true to bypass tier routing and always run NLM.
     """
     if not registry:
         raise HTTPException(503, "Registry not initialized")
@@ -1046,84 +1047,39 @@ async def curate_endpoint(project: str):
             "existing_curated_files": len(existing),
         }
 
-    # Step 3: NLM sync
+    # Step 3: Compute and store tier
+    computed = compute_tier(project, os.path.join(CURATED_DIR, project), entry)
+    registry.update_fields(project, computed_tier=computed)
+    # Re-fetch entry to get updated tier
+    entry = registry.get(project) or entry
+    tier = entry.get("tier") or computed
+
+    # Step 4: Distill based on tier (or force_nlm)
     curated_dir = os.path.join(CURATED_DIR, project)
     curated_path = Path(curated_dir)
     if not curated_path.is_dir() or not list(curated_path.glob("*.md")):
-        result["steps"]["nlm"] = {"status": "skipped_no_curated_files"}
+        result["steps"]["distill"] = {"status": "skipped_no_curated_files"}
+        result["tier"] = tier
+        result["distill_backend"] = "skipped"
         return result
 
-    # Ensure notebook
-    notebook_id = entry.get("notebook_id")
-    if not notebook_id:
-        notebook_id = await nlm.ensure_notebook(f"AI-Lab: {project}")
-        if notebook_id:
-            registry._data["projects"][project]["notebook_id"] = notebook_id
-            registry._persist()
+    if force_nlm and not NLM_ENABLED:
+        return JSONResponse(status_code=503, content={"error": "NLM is disabled (NLM_ENABLED=false)"})
 
-    if not notebook_id:
-        result["steps"]["nlm"] = {"status": "error", "message": "Failed to create/find notebook"}
-        return result
+    distill_backend = "unknown"
+    try:
+        await _distill_project(project, force_nlm=force_nlm)
+        distill_backend = "nlm" if force_nlm else ("nlm" if (tier == 1 and not entry.get("nlm_baseline")) else ("llm" if tier <= 2 else "direct"))
+    except ValueError as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+    except Exception as e:
+        logger.error(f"Distillation failed for {project}: {e}")
+        distill_backend = "failed"
 
-    # Run NLM cycle
-    _nlm_call_stats["total"] += 1
-    nlm_result = await nlm.run_nlm_cycle(notebook_id, curated_dir, project_name=project)
-
-    if nlm_result["success"]:
-        _nlm_call_stats["success"] += 1
-
-        # Step 4: Index notes into Qdrant (skip error responses)
-        indexed = 0
-        for note in nlm_result["notes"]:
-            if _is_nlm_error(note.get("answer", "")):
-                logger.warning(f"Skipping contaminated NLM response for {project}: {note.get('question', '')[:50]}")
-                continue
-            embedding = embed_text(f"{note['question']} {note['answer'][:200]}")
-            point_id = generate_point_id(f"nlm:{project}:{note['question'][:50]}", 0)
-            upsert_points([{
-                "id": point_id,
-                "vector": embedding,
-                "payload": {
-                    "text": note["answer"],
-                    "question": note["question"],
-                    "source": f"nlm:{project}",
-                    "project": project,
-                    "from_nlm": True,
-                    "type": note["type"],
-                    "chunk_index": 0,
-                },
-            }], COLLECTION_NLM_NOTES)
-            indexed += 1
-
-        # Update registry
-        proj = registry._data["projects"].get(project)
-        if proj:
-            proj["nlm_source_count"] = nlm_result.get("sources_uploaded", 0)
-            proj["nlm_consecutive_failures"] = 0
-            proj["status"] = "validated"
-            proj["coverage"] = 1.0
-            proj["last_nlm_session"] = _now_iso()
-            registry._persist()
-
-        result["steps"]["nlm"] = {
-            "status": "ok",
-            "notebook_id": notebook_id,
-            "sources_uploaded": nlm_result.get("sources_uploaded", 0),
-            "sync_stats": nlm_result.get("sync_stats", {}),
-            "notes_generated": len(nlm_result["notes"]),
-        }
-        result["steps"]["qdrant"] = {"status": "ok", "indexed": indexed}
-
-        audit_log({"action": "nlm_validated", "project": project, "notes": len(nlm_result["notes"])})
-    else:
-        proj = registry._data["projects"].get(project)
-        if proj:
-            proj["nlm_consecutive_failures"] = proj.get("nlm_consecutive_failures", 0) + 1
-            registry._persist()
-        result["steps"]["nlm"] = {"status": "error", "message": "NLM cycle failed"}
-        audit_log({"action": "nlm_failed", "project": project})
-
-    result["status"] = "validated" if nlm_result["success"] else "partial"
+    result["steps"]["distill"] = {"status": "ok" if distill_backend != "failed" else "error", "backend": distill_backend}
+    result["tier"] = tier
+    result["distill_backend"] = distill_backend
+    result["status"] = "validated" if distill_backend != "failed" else "partial"
     return result
 
 
