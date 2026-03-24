@@ -283,6 +283,10 @@ async def _scan_project(project_name: str):
                 audit_log({"action": "curation_complete", "project": project_name,
                            "features": curation_result.features, "source": f"remote:{node}"})
                 logger.info(f"Curated {project_name} (remote/{node}): {curation_result.curated_files} features")
+                # Compute tier from curated output
+                computed = compute_tier(project_name, os.path.join(CURATED_DIR, project_name), entry)
+                registry.update_fields(project_name, computed_tier=computed)
+                logger.info(f"Tier for {project_name}: {computed} ({curation_result.curated_files} features)")
         except Exception as e:
             logger.error(f"Curation failed for remote {project_name}: {e}")
         return
@@ -337,6 +341,10 @@ async def _scan_project(project_name: str):
                 "curated_files": curation_result.curated_files,
             })
             logger.info(f"Curated {project_name}: {curation_result.curated_files} features")
+            # Compute tier from curated output
+            computed = compute_tier(project_name, os.path.join(CURATED_DIR, project_name), entry)
+            registry.update_fields(project_name, computed_tier=computed)
+            logger.info(f"Tier for {project_name}: {computed} ({curation_result.curated_files} features)")
         elif curation_result.errors:
             project = registry._data["projects"].get(project_name)
             if project:
@@ -813,6 +821,13 @@ async def metrics():
     feedback_entries = _load_feedback()
     feedback_stats = _compute_feedback_stats(feedback_entries)
 
+    tier_distribution = {1: 0, 2: 0, 3: 0}
+    for name in registry.list_all():
+        entry = registry.get(name)
+        if entry:
+            tier = entry.get("tier") or entry.get("computed_tier", 3)
+            tier_distribution[tier] = tier_distribution.get(tier, 0) + 1
+
     return {
         "coverage": summary,
         "freshness_avg_minutes": round(statistics.mean(freshness_values), 1) if freshness_values else 0,
@@ -825,6 +840,10 @@ async def metrics():
         "coherence_last_run": _coherence_cache.get("timestamp"),
         "last_scan": _last_scan_time,
         "feedback": feedback_stats,
+        "tiers": {
+            "distribution": tier_distribution,
+            "nlm_baseline_count": sum(1 for n in registry.list_all() if (registry.get(n) or {}).get("nlm_baseline")),
+        },
     }
 
 
