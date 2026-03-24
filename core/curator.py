@@ -17,13 +17,13 @@ logger = logging.getLogger("erudito.curator")
 
 # Known document type prefixes and their section titles + sort order
 DOC_TYPES = {
-    "SPEC": ("Diseño", 1),
+    "SPEC": ("Design", 1),
     "PLAN": ("Plan", 2),
-    "IR": ("Implementación", 3),
-    "SOP": ("Operación", 4),
-    "CONTRACT": ("Contrato", 5),
-    "REPORT": ("Reporte", 6),
-    "REVIEW": ("Revisión", 7),
+    "IR": ("Implementation", 3),
+    "SOP": ("Operations", 4),
+    "CONTRACT": ("Contract", 5),
+    "REPORT": ("Report", 6),
+    "REVIEW": ("Review", 7),
 }
 
 _PREFIX_RE = re.compile(
@@ -135,7 +135,7 @@ def classify_doc_type(filename: str) -> tuple[str, int]:
     for prefix, (section, order) in DOC_TYPES.items():
         if upper.startswith(f"{prefix}-"):
             return section, order
-    return "Documentación", 8
+    return "Documentation", 8
 
 
 def consolidate_feature(

@@ -2,6 +2,20 @@ import pytest
 from core.curator import extract_feature_name
 
 
+def test_doc_types_are_english():
+    """All curator section titles must be in English per policy."""
+    from core.curator import DOC_TYPES
+    for prefix, (title, _order) in DOC_TYPES.items():
+        assert title.isascii(), f"{prefix} title '{title}' contains non-ASCII"
+    expected = {
+        "SPEC": "Design", "PLAN": "Plan", "IR": "Implementation",
+        "SOP": "Operations", "CONTRACT": "Contract",
+        "REPORT": "Report", "REVIEW": "Review",
+    }
+    for prefix, expected_title in expected.items():
+        assert DOC_TYPES[prefix][0] == expected_title, f"{prefix} should be '{expected_title}'"
+
+
 class TestExtractFeatureName:
     def test_spec_prefix(self):
         assert extract_feature_name("SPEC-KEYSTONE-ARCHITECTURE.md") == "keystone-architecture"
@@ -94,22 +108,22 @@ from core.curator import classify_doc_type, consolidate_feature, FileInfo
 class TestClassifyDocType:
     def test_spec(self):
         section, order = classify_doc_type("SPEC-KEYSTONE.md")
-        assert section == "Diseño"
+        assert section == "Design"
         assert order == 1
 
     def test_ir(self):
         section, order = classify_doc_type("IR-2026-03-11-keystone.md")
-        assert section == "Implementación"
+        assert section == "Implementation"
         assert order == 3
 
     def test_sop(self):
         section, order = classify_doc_type("SOP-KEYSTONE.md")
-        assert section == "Operación"
+        assert section == "Operations"
         assert order == 4
 
     def test_unknown(self):
         section, order = classify_doc_type("CLAUDE.md")
-        assert section == "Documentación"
+        assert section == "Documentation"
         assert order == 8
 
     def test_plan(self):
@@ -126,8 +140,8 @@ class TestConsolidateFeature:
         ]
         result = consolidate_feature("test-project", "keystone", files)
         assert "# Feature: keystone" in result
-        assert "## Diseño" in result
-        assert "## Operación" in result
+        assert "## Design" in result
+        assert "## Operations" in result
         assert "Content here." in result
         assert "Ops content." in result
 
@@ -138,9 +152,9 @@ class TestConsolidateFeature:
             FileInfo("IR-2026-03-11-keystone.md", "impl", "2026-03-11"),
         ]
         result = consolidate_feature("test-project", "keystone", files)
-        spec_pos = result.index("## Diseño")
-        impl_pos = result.index("## Implementación")
-        ops_pos = result.index("## Operación")
+        spec_pos = result.index("## Design")
+        impl_pos = result.index("## Implementation")
+        ops_pos = result.index("## Operations")
         assert spec_pos < impl_pos < ops_pos
 
     def test_frontmatter_present(self):
