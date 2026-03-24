@@ -32,14 +32,14 @@ curl -s -X POST "$ERUDITO/nlm/reset" | python3 -m json.tool
 
 echo ""
 echo "=== Step 3: Test NLM connectivity ==="
-NLM_STATUS=$(curl -s "$ERUDITO/nlm/status" | python3 -c "import sys,json; print(json.load(sys.stdin)['tripped'])")
-if [ "$NLM_STATUS" = "True" ]; then
-    echo "ERROR: NLM still rate limited. Try again later."
-    exit 1
-fi
-
-# Test with a simple query
-docker exec erudito python3 -c "
+NLM_AVAILABLE=true
+NLM_STATUS=$(curl -s "$ERUDITO/nlm/status" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tripped', False))" 2>/dev/null || echo "error")
+if [ "$NLM_STATUS" = "True" ] || [ "$NLM_STATUS" = "error" ]; then
+    echo "WARNING: NLM not available (status=$NLM_STATUS). Skipping Tier 1, proceeding with Tier 2/3."
+    NLM_AVAILABLE=false
+else
+    # Test with a simple query (don't abort on failure)
+    if ! docker exec erudito python3 -c "
 import asyncio, sys
 sys.path.insert(0, '/app')
 async def test():
@@ -47,7 +47,11 @@ async def test():
     nbs = await list_notebooks()
     print(f'NLM OK: {len(nbs)} notebooks accessible')
 asyncio.run(test())
-"
+" 2>/dev/null; then
+        echo "WARNING: NLM connectivity test failed. Skipping Tier 1, proceeding with Tier 2/3."
+        NLM_AVAILABLE=false
+    fi
+fi
 
 echo ""
 echo "=== Step 3.5: Identifying Tier 1 (NLM) projects ==="
@@ -64,6 +68,9 @@ for name in r.list_all():
 echo "Tier 1 projects: $TIER1_PROJECTS"
 
 echo ""
+if [ "$NLM_AVAILABLE" = "false" ]; then
+    echo "=== Step 4: SKIPPED (NLM not available) ==="
+else
 echo "=== Step 4: Re-curate Tier 1 projects via NLM (2 at a time) ==="
 
 # Build pairs from Tier 1 projects
@@ -97,6 +104,7 @@ while [ $i -lt ${#TIER1_ARRAY[@]} ]; do
     sleep 30
     i=$((i + 2))
 done
+fi  # end NLM_AVAILABLE check
 
 echo ""
 echo "=== Step 4b: Distilling Tier 2 and 3 projects (no NLM needed) ==="

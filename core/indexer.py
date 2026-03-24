@@ -157,7 +157,8 @@ def search_by_filter(
             f"/collections/{collection}/points/scroll",
             data=body,
         )
-        return result.get("result", {}).get("points", [])
+        inner = result.get("result") or {}
+        return inner.get("points", [])
     except Exception as e:
         logger.warning(f"Qdrant scroll error: {e}")
         return []

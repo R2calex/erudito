@@ -29,3 +29,5 @@
 - [ ] **push-docs.sh filename escaping**: Escape `$BASENAME` through json.dumps. (review #17)
 - [ ] **Register endpoint for remote projects**: Allow POST /registry without path/git validation when node != hanzo. (review #15)
 - [ ] **Dockerfile safe.directory**: Restrict to specific mounted paths instead of '*'. (review #19)
+- [ ] **NLM concurrency on HTTP path**: `/curate?force_nlm=true` bypasses the NLM semaphore since it doesn't go through `_bounded_distill`. Add semaphore acquisition in `_distill_project` for NLM calls. (review #21)
+- [ ] **Stale nlm_consecutive_failures read**: `_distill_nlm` reads `entry` at top, then increments counter from stale snapshot. Use atomic increment in `update_fields` or re-read before write. (review #22)
