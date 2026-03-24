@@ -129,6 +129,40 @@ def search(query_embedding: list[float], collection: str = COLLECTION_KNOWLEDGE,
     return [{"score": r["score"], "payload": r.get("payload", {})} for r in result.get("result", [])]
 
 
+def search_by_filter(
+    collection: str,
+    filters: dict,
+    limit: int = 10,
+) -> list[dict]:
+    """Scroll Qdrant points matching exact filter conditions (no vector search).
+
+    Args:
+        collection: Qdrant collection name
+        filters: Dict of field_name -> value for exact match
+        limit: Max points to return
+
+    Returns:
+        List of point dicts with "id" and "payload"
+    """
+    must_conditions = [
+        {"key": k, "match": {"value": v}} for k, v in filters.items()
+    ]
+    body = {
+        "filter": {"must": must_conditions},
+        "limit": limit,
+        "with_payload": True,
+    }
+    try:
+        result = _qdrant_request(
+            f"/collections/{collection}/points/scroll",
+            data=body,
+        )
+        return result.get("result", {}).get("points", [])
+    except Exception as e:
+        logger.warning(f"Qdrant scroll error: {e}")
+        return []
+
+
 def index_delta(delta: dict) -> int:
     """Index a Delta object into Qdrant. Returns number of points upserted.
 

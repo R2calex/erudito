@@ -51,3 +51,22 @@ class TestPointId:
         pid = generate_point_id("test.md", 5)
         assert isinstance(pid, int)
         assert pid > 0
+
+
+def test_search_by_filter_returns_matching_points(monkeypatch):
+    """search_by_filter should query Qdrant with scroll and filter conditions."""
+    from core import indexer
+    captured = {}
+
+    def mock_qdrant(path, data=None, method="POST"):
+        captured["path"] = path
+        captured["data"] = data
+        return {"result": {"points": [
+            {"id": 1, "payload": {"question": "Q1", "text": "A1", "project": "test"}},
+        ]}, "status": "ok"}
+
+    monkeypatch.setattr("core.indexer._qdrant_request", mock_qdrant)
+    results = indexer.search_by_filter("nlm_notes", {"project": "test", "canonical": True}, limit=10)
+    assert len(results) == 1
+    assert results[0]["payload"]["question"] == "Q1"
+    assert "scroll" in captured["path"]
