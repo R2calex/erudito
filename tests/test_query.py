@@ -59,3 +59,16 @@ class TestRegistryIntent:
 
     def test_curation_status(self):
         assert detect_registry_intent("What is the curation_status of erudito?") == "curation_status"
+
+
+def test_get_distill_source_backwards_compat():
+    from core.query import _get_distill_source
+    # New format
+    assert _get_distill_source({"distill_source": "nlm"}) == "nlm"
+    assert _get_distill_source({"distill_source": "llm"}) == "llm"
+    assert _get_distill_source({"distill_source": "direct"}) == "direct"
+    # Old format (backwards compat)
+    assert _get_distill_source({"from_nlm": True}) == "nlm"
+    # No source info
+    assert _get_distill_source({}) == ""
+    assert _get_distill_source({"from_nlm": False}) == ""

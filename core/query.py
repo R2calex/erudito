@@ -100,6 +100,16 @@ def answer_from_registry(query: str, field: str, registry, project: str | None =
     }
 
 
+def _get_distill_source(payload: dict) -> str:
+    """Get distill_source from payload, with from_nlm fallback for old data."""
+    ds = payload.get("distill_source")
+    if ds:
+        return ds
+    if payload.get("from_nlm"):
+        return "nlm"
+    return ""
+
+
 def classify_confidence(score: float) -> str:
     """Classify score into confidence level."""
     if score >= CONFIDENCE_THRESHOLD:
@@ -140,8 +150,9 @@ def build_response(
     formatted_sources = []
     for s in sources[:5]:
         payload = s.get("payload", {})
+        ds = _get_distill_source(payload)
         formatted_sources.append({
-            "type": "nlm_note" if payload.get("from_nlm") else "qdrant",
+            "type": "nlm_note" if ds in ("nlm", "llm") else ("curated_doc" if ds == "direct" else "qdrant"),
             "project": payload.get("project", ""),
             "file": payload.get("source", ""),
             "score": round(s["score"], 4),
@@ -188,7 +199,8 @@ async def execute_query(
     nlm_results = search(query_embedding, COLLECTION_NLM_NOTES, top_k, project)
 
     for r in nlm_results:
-        r["payload"]["from_nlm"] = True
+        r["payload"].setdefault("distill_source", "nlm")
+        r["payload"]["from_nlm"] = True  # backwards compat
 
     top_results = nlm_results[:top_k]
     best_score = top_results[0]["score"] if top_results else 0.0
@@ -217,7 +229,8 @@ async def execute_query(
                         "text": nlm_answer,
                         "source": f"nlm_live:{query[:80]}",
                         "project": project,
-                        "from_nlm": True,
+                        "distill_source": "nlm",
+                        "from_nlm": True,  # backwards compat
                         "chunk_index": 0,
                     },
                 }], COLLECTION_NLM_NOTES)
