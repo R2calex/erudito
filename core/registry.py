@@ -30,6 +30,11 @@ _DEFAULT_ENTRY = {
     "curated_at": None,
     "curated_files": 0,
     "nlm_consecutive_failures": 0,
+    "tier": None,               # None = auto-assign, 1/2/3 = manual override
+    "computed_tier": 3,          # Last auto-computed tier
+    "nlm_baseline": False,       # True after first successful NLM distillation
+    "last_distill": None,        # ISO timestamp of last distillation (any backend)
+    "last_nlm_distill": None,    # ISO timestamp of last NLM distillation
 }
 
 

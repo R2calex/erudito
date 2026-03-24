@@ -116,3 +116,15 @@ class TestCurationFields:
         summary = tmp_registry.summary()
         assert "curation_pct" in summary
         assert "curation_pending" in summary
+
+
+def test_default_entry_has_tier_fields(tmp_path):
+    from core.registry import Registry
+    r = Registry(yaml_path=str(tmp_path / "reg.yaml"))
+    r.register("test-project", path="/tmp/test", node="hanzo", repo="")
+    entry = r.get("test-project")
+    assert entry["tier"] is None
+    assert entry["computed_tier"] == 3
+    assert entry["nlm_baseline"] is False
+    assert entry["last_distill"] is None
+    assert entry["last_nlm_distill"] is None
