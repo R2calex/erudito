@@ -42,6 +42,10 @@ FIXED_QUESTIONS = [
     "Where is this project located (path, node, repository)?",
 ]
 
+from core.distiller import DISTILL_QUESTIONS  # noqa: E402
+# FIXED_QUESTIONS remains for NLM (superset of 8 questions).
+# DISTILL_QUESTIONS (5) is the canonical set used for indexing.
+
 _REQUEST_ID = 0
 
 

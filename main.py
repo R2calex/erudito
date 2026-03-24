@@ -22,7 +22,10 @@ from core.indexer import (
     index_delta, ensure_collection, embed_text, search,
     upsert_points, generate_point_id,
     COLLECTION_KNOWLEDGE, COLLECTION_NLM_NOTES,
+    search_by_filter,
 )
+from core.distiller import compute_tier, build_llm_prompt, parse_llm_response, DISTILL_QUESTIONS
+from core.distiller import DISTILL_LLM_MODEL as _LLM_MODEL, DISTILL_LLM_TIMEOUT, DISTILL_LLM_MAX_TOKENS, LITELLM_URL
 from core.query import execute_query
 from integrations.sanitizer import sanitize_text
 from integrations import notebooklm as nlm
@@ -40,6 +43,10 @@ MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "3"))
 CURATED_DIR = os.path.join(DATA_DIR, "curated")
 MAX_CONCURRENT_NLM = int(os.getenv("MAX_CONCURRENT_NLM", "2"))
 NLM_ENABLED = os.getenv("NLM_ENABLED", "false").lower() == "true"
+MAX_CONCURRENT_DISTILL = int(os.getenv("MAX_CONCURRENT_DISTILL", "5"))
+FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback.jsonl")
+FEEDBACK_THRESHOLD_PCT = int(os.getenv("FEEDBACK_THRESHOLD_PCT", "70"))
+FEEDBACK_WINDOW_SIZE = int(os.getenv("FEEDBACK_WINDOW_SIZE", "20"))
 INGESTED_DIR = os.path.join(DATA_DIR, "ingested")
 
 # Node → DevOps Agent URL mapping for remote file discovery
@@ -55,6 +62,7 @@ _scan_task: asyncio.Task | None = None
 _nlm_sync_task: asyncio.Task | None = None
 _scan_semaphore: asyncio.Semaphore | None = None
 _nlm_semaphore: asyncio.Semaphore | None = None
+_distill_semaphore: asyncio.Semaphore | None = None
 _coherence_cache: dict = {"score": None, "timestamp": None}
 _nlm_call_stats: dict = {"success": 0, "total": 0}
 _query_stats: dict = {"high": 0, "total": 0}
@@ -445,6 +453,223 @@ async def _fallback_index_curated(project_name: str):
             audit_log({"action": "fallback_index", "project": project_name, "points": count})
         except Exception as e:
             logger.error(f"Fallback indexing failed for {project_name}: {e}")
+
+
+# --- Tier-based Distillation ---
+
+def _fetch_existing_notes(project_name: str) -> list[dict]:
+    """Fetch existing distilled notes from Qdrant nlm_notes collection."""
+    try:
+        results = search_by_filter(
+            COLLECTION_NLM_NOTES,
+            {"project": project_name, "canonical": True},
+            limit=10,
+        )
+        return [
+            {"question": r["payload"]["question"], "answer": r["payload"]["text"]}
+            for r in results if "question" in r.get("payload", {})
+        ]
+    except Exception as e:
+        logger.warning(f"Failed to fetch existing notes for {project_name}: {e}")
+        return []
+
+
+async def _distill_project(project_name: str, force_nlm: bool = False):
+    """Dispatch distillation based on project tier."""
+    entry = registry.get(project_name)
+    if not entry:
+        return
+    curated_dir = os.path.join(CURATED_DIR, project_name)
+    tier = entry.get("tier") or entry.get("computed_tier", 3)
+
+    if force_nlm:
+        if not NLM_ENABLED:
+            raise ValueError("NLM is disabled (NLM_ENABLED=false)")
+        if nlm.is_circuit_open():
+            raise ValueError("NLM circuit breaker is tripped")
+        try:
+            await _distill_nlm(project_name, curated_dir)
+        except Exception as e:
+            logger.error(f"force_nlm failed for {project_name}: {e}")
+            raise
+        return
+
+    if tier == 1:
+        if not entry.get("nlm_baseline"):
+            if NLM_ENABLED and not nlm.is_circuit_open():
+                try:
+                    await _distill_nlm(project_name, curated_dir)
+                except Exception as e:
+                    logger.warning(f"NLM unavailable for {project_name} baseline, falling back to LLM: {e}")
+                    await _distill_llm(project_name, curated_dir, nlm_notes=None)
+            else:
+                logger.info(f"NLM not available for {project_name} baseline, using LLM")
+                await _distill_llm(project_name, curated_dir, nlm_notes=None)
+        else:
+            existing_notes = _fetch_existing_notes(project_name)
+            await _distill_llm(project_name, curated_dir, nlm_notes=existing_notes)
+    elif tier == 2:
+        await _distill_llm(project_name, curated_dir, nlm_notes=None)
+    else:
+        await _distill_direct(project_name, curated_dir)
+
+
+async def _distill_nlm(project_name: str, curated_dir: str):
+    """Distill via NotebookLM (Tier 1 initial or force_nlm)."""
+    entry = registry.get(project_name)
+    notebook_id = entry.get("notebook_id")
+
+    if not notebook_id:
+        notebook_id = await nlm.ensure_notebook(f"AI-Lab: {project_name}")
+        if notebook_id:
+            registry.update_fields(project_name, notebook_id=notebook_id)
+            logger.info(f"Created notebook for {project_name}: {notebook_id}")
+        else:
+            registry.update_fields(
+                project_name,
+                nlm_consecutive_failures=entry.get("nlm_consecutive_failures", 0) + 1,
+            )
+            raise Exception(f"Failed to create notebook for {project_name}")
+
+    _nlm_call_stats["total"] += 1
+    result = await nlm.run_nlm_cycle(notebook_id, curated_dir, project_name=project_name)
+
+    if result["success"]:
+        _nlm_call_stats["success"] += 1
+        indexed = 0
+        for i, note in enumerate(result["notes"]):
+            if _is_nlm_error(note.get("answer", "")):
+                logger.warning(f"Skipping contaminated NLM response for {project_name}")
+                continue
+            embedding = embed_text(f"{note['question']} {note['answer'][:200]}")
+            point_id = generate_point_id(f"nlm:{project_name}:{note['question'][:50]}", 0)
+            is_canonical = note.get("question", "") in DISTILL_QUESTIONS
+            upsert_points([{
+                "id": point_id,
+                "vector": embedding,
+                "payload": {
+                    "text": note["answer"],
+                    "question": note["question"],
+                    "source": "nlm",
+                    "distill_source": "nlm",
+                    "project": project_name,
+                    "from_nlm": True,
+                    "type": "qa",
+                    "model": "notebooklm",
+                    "canonical": is_canonical,
+                    "chunk_index": i,
+                },
+            }], collection=COLLECTION_NLM_NOTES)
+            indexed += 1
+
+        registry.update_fields(
+            project_name,
+            nlm_baseline=True,
+            last_distill=_now_iso(),
+            last_nlm_distill=_now_iso(),
+            nlm_consecutive_failures=0,
+            status="synced",
+        )
+        audit_log({"action": "distill_nlm", "project": project_name, "notes": indexed})
+    else:
+        registry.update_fields(
+            project_name,
+            nlm_consecutive_failures=entry.get("nlm_consecutive_failures", 0) + 1,
+        )
+        raise Exception(f"NLM cycle failed for {project_name}")
+
+
+async def _distill_llm(project_name: str, curated_dir: str, nlm_notes: list[dict] | None = None):
+    """Distill via LLM (Tier 2, or Tier 1 with baseline)."""
+    import litellm
+
+    curated_path = Path(curated_dir)
+    if not curated_path.exists():
+        logger.warning(f"No curated dir for {project_name}: {curated_dir}")
+        return
+
+    curated_files = []
+    for md_file in sorted(curated_path.glob("*.md")):
+        curated_files.append({
+            "name": md_file.name,
+            "content": md_file.read_text(encoding="utf-8"),
+        })
+
+    if not curated_files:
+        logger.warning(f"No curated files for {project_name}")
+        return
+
+    prompt = build_llm_prompt(project_name, curated_files, nlm_notes)
+
+    try:
+        response = await litellm.acompletion(
+            model=_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": prompt["system"]},
+                {"role": "user", "content": prompt["user"]},
+            ],
+            api_base=LITELLM_URL,
+            timeout=DISTILL_LLM_TIMEOUT,
+            max_tokens=DISTILL_LLM_MAX_TOKENS,
+        )
+        raw_answer = response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"LLM distill failed for {project_name}: {e}")
+        audit_log({"action": "distill_llm_error", "project": project_name, "error": str(e)})
+        return
+
+    notes = parse_llm_response(raw_answer, project_name)
+    if not notes:
+        logger.warning(f"LLM response unparseable for {project_name}")
+        audit_log({"action": "distill_llm_parse_error", "project": project_name})
+        return
+
+    for note in notes:
+        embedding = embed_text(f"{note['question']} {note['text'][:200]}")
+        point_id = generate_point_id(f"llm:{project_name}:{note['question'][:50]}", 0)
+        upsert_points([{
+            "id": point_id,
+            "vector": embedding,
+            "payload": note,
+        }], collection=COLLECTION_NLM_NOTES)
+
+    registry.update_fields(project_name, last_distill=_now_iso(), status="synced")
+    audit_log({"action": "distill_llm", "project": project_name, "notes": len(notes),
+               "model": _LLM_MODEL, "had_nlm_context": nlm_notes is not None})
+
+
+async def _distill_direct(project_name: str, curated_dir: str):
+    """Distill by directly embedding curated docs (Tier 3)."""
+    curated_path = Path(curated_dir)
+    if not curated_path.exists():
+        logger.warning(f"No curated dir for {project_name}: {curated_dir}")
+        return
+
+    indexed = 0
+    for i, md_file in enumerate(sorted(curated_path.glob("*.md"))):
+        content = md_file.read_text(encoding="utf-8")
+        feature_name = md_file.stem
+        embedding = embed_text(content[:2000])
+        point_id = generate_point_id(f"direct:{project_name}:{feature_name}", 0)
+        upsert_points([{
+            "id": point_id,
+            "vector": embedding,
+            "payload": {
+                "text": content,
+                "question": f"Project documentation: {feature_name}",
+                "source": "direct",
+                "distill_source": "direct",
+                "project": project_name,
+                "type": "curated_doc",
+                "model": None,
+                "canonical": True,
+                "chunk_index": i,
+            },
+        }], collection=COLLECTION_NLM_NOTES)
+        indexed += 1
+
+    registry.update_fields(project_name, last_distill=_now_iso(), status="synced")
+    audit_log({"action": "distill_direct", "project": project_name, "docs": indexed})
 
 
 @asynccontextmanager
