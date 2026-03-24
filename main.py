@@ -14,6 +14,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from core.curator import curate_project
 from core.registry import Registry
@@ -92,6 +93,63 @@ def audit_log(entry: dict):
     entry["timestamp"] = _now_iso()
     with open(AUDIT_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+class FeedbackRequest(BaseModel):
+    project: str
+    query: str
+    useful: bool
+    coherent: bool
+    logical: bool
+
+
+def _load_feedback(limit: int = 0) -> list[dict]:
+    """Load feedback entries from JSONL file."""
+    if not os.path.exists(FEEDBACK_FILE):
+        return []
+    entries = []
+    with open(FEEDBACK_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    if limit > 0:
+        return entries[-limit:]
+    return entries
+
+
+def _compute_feedback_stats(
+    entries: list[dict],
+    threshold: int = FEEDBACK_THRESHOLD_PCT,
+    window: int = FEEDBACK_WINDOW_SIZE,
+) -> dict:
+    """Compute per-project feedback stats from entries."""
+    from collections import defaultdict
+    by_project = defaultdict(list)
+    for e in entries:
+        by_project[e.get("project", "unknown")].append(e)
+
+    stats = {}
+    for project, items in by_project.items():
+        recent = items[-window:]
+        total = len(recent)
+        if total == 0:
+            continue
+        useful_pct = round(sum(1 for i in recent if i.get("useful")) / total * 100, 1)
+        coherent_pct = round(sum(1 for i in recent if i.get("coherent")) / total * 100, 1)
+        logical_pct = round(sum(1 for i in recent if i.get("logical")) / total * 100, 1)
+        needs_review = useful_pct < threshold or coherent_pct < threshold or logical_pct < threshold
+        stats[project] = {
+            "total": total,
+            "useful_pct": useful_pct,
+            "coherent_pct": coherent_pct,
+            "logical_pct": logical_pct,
+            "needs_review": needs_review,
+        }
+    return stats
 
 
 async def _scan_loop():
@@ -705,6 +763,22 @@ async def nlm_status():
     }
 
 
+@app.post("/feedback")
+async def feedback_endpoint(req: FeedbackRequest):
+    """Record consumer feedback for a query result."""
+    entry = {
+        "timestamp": _now_iso(),
+        "project": req.project,
+        "query": req.query,
+        "useful": req.useful,
+        "coherent": req.coherent,
+        "logical": req.logical,
+    }
+    with open(FEEDBACK_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return {"status": "recorded"}
+
+
 @app.get("/metrics")
 async def metrics():
     if not registry:
@@ -736,6 +810,9 @@ async def metrics():
         _query_stats["high"] / _query_stats["total"] * 100, 1
     ) if _query_stats["total"] > 0 else 0.0
 
+    feedback_entries = _load_feedback()
+    feedback_stats = _compute_feedback_stats(feedback_entries)
+
     return {
         "coverage": summary,
         "freshness_avg_minutes": round(statistics.mean(freshness_values), 1) if freshness_values else 0,
@@ -747,6 +824,7 @@ async def metrics():
         "coherence_last_score": _coherence_cache.get("score"),
         "coherence_last_run": _coherence_cache.get("timestamp"),
         "last_scan": _last_scan_time,
+        "feedback": feedback_stats,
     }
 
 
