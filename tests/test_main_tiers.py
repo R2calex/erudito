@@ -77,6 +77,26 @@ class TestDistillProject:
             mock_direct.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_force_nlm_raises_when_disabled(self, mock_registry):
+        with patch("main.registry", mock_registry), \
+             patch("main.NLM_ENABLED", False):
+            mock_registry.get.return_value = {"computed_tier": 3, "tier": None}
+            from main import _distill_project
+            with pytest.raises(ValueError, match="NLM is disabled"):
+                await _distill_project("project", force_nlm=True)
+
+    @pytest.mark.asyncio
+    async def test_force_nlm_raises_when_circuit_open(self, mock_registry):
+        with patch("main.registry", mock_registry), \
+             patch("main.NLM_ENABLED", True), \
+             patch("main.nlm") as mock_nlm_module:
+            mock_nlm_module.is_circuit_open.return_value = True
+            mock_registry.get.return_value = {"computed_tier": 3, "tier": None}
+            from main import _distill_project
+            with pytest.raises(ValueError, match="circuit breaker"):
+                await _distill_project("project", force_nlm=True)
+
+    @pytest.mark.asyncio
     async def test_tier1_nlm_failure_falls_back_to_llm(self, mock_registry):
         with patch("main.registry", mock_registry), \
              patch("main.NLM_ENABLED", True), \
