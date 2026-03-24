@@ -50,20 +50,31 @@ asyncio.run(test())
 "
 
 echo ""
-echo "=== Step 4: Re-curate projects (2 at a time) ==="
+echo "=== Step 3.5: Identifying Tier 1 (NLM) projects ==="
+TIER1_PROJECTS=$(python3 -c "
+import sys, os
+sys.path.insert(0, '.')
+from core.registry import Registry
+r = Registry(yaml_path='data/registry.yaml')
+for name in r.list_all():
+    e = r.get(name)
+    if e and (e.get('tier') or e.get('computed_tier', 3)) == 1:
+        print(name)
+")
+echo "Tier 1 projects: $TIER1_PROJECTS"
 
-# Projects to re-curate (all except erudito which is clean)
-PROJECTS=(
-    "infra-mcp devops-agent"
-    "mesh-monitor event-bus"
-    "marker-mcp qdrant-mcp"
-    "agent-eval opencode-contracts"
-    "jasper jasper-profiles"
-    "kubo-contracts sariatu-docs"
-    "openclaw-kubo"
-)
+echo ""
+echo "=== Step 4: Re-curate Tier 1 projects via NLM (2 at a time) ==="
 
-for PAIR in "${PROJECTS[@]}"; do
+# Build pairs from Tier 1 projects
+TIER1_ARRAY=($TIER1_PROJECTS)
+i=0
+while [ $i -lt ${#TIER1_ARRAY[@]} ]; do
+    PAIR="${TIER1_ARRAY[$i]}"
+    if [ $((i + 1)) -lt ${#TIER1_ARRAY[@]} ]; then
+        PAIR="$PAIR ${TIER1_ARRAY[$((i + 1))]}"
+    fi
+
     echo ""
     echo "--- Processing: $PAIR ---"
     for PROJECT in $PAIR; do
@@ -77,13 +88,30 @@ for PAIR in "${PROJECTS[@]}"; do
     TRIPPED=$(curl -s "$ERUDITO/nlm/status" | python3 -c "import sys,json; print(json.load(sys.stdin)['tripped'])" 2>/dev/null)
     if [ "$TRIPPED" = "True" ]; then
         echo ""
-        echo "WARNING: NLM rate limited. Stopping. Resume tomorrow."
-        echo "Remaining projects will be processed in the next run."
-        exit 0
+        echo "WARNING: NLM rate limited. Stopping NLM curation. Resume tomorrow."
+        echo "Remaining Tier 1 projects will be processed in the next run."
+        break
     fi
 
     echo "  Waiting 30s before next pair..."
     sleep 30
+    i=$((i + 2))
+done
+
+echo ""
+echo "=== Step 4b: Distilling Tier 2 and 3 projects (no NLM needed) ==="
+for project in $(python3 -c "
+import sys, os
+sys.path.insert(0, '.')
+from core.registry import Registry
+r = Registry(yaml_path='data/registry.yaml')
+for name in r.list_all():
+    e = r.get(name)
+    if e and (e.get('tier') or e.get('computed_tier', 3)) >= 2:
+        print(name)
+"); do
+    echo "Distilling (LLM/Direct): $project"
+    curl -s -X POST "http://localhost:8095/curate/$project" > /dev/null 2>&1
 done
 
 echo ""
