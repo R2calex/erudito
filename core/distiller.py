@@ -23,7 +23,7 @@ TIER1_THRESHOLD = int(os.getenv("TIER1_THRESHOLD", "5"))
 TIER2_THRESHOLD = int(os.getenv("TIER2_THRESHOLD", "3"))
 
 # LLM config
-DISTILL_LLM_MODEL = os.getenv("DISTILL_LLM_MODEL", "minimax-m2.5")
+DISTILL_LLM_MODEL = os.getenv("DISTILL_LLM_MODEL", "zen/minimax-m2.5")
 DISTILL_LLM_TIMEOUT = int(os.getenv("DISTILL_LLM_TIMEOUT", "120"))
 DISTILL_LLM_MAX_TOKENS = int(os.getenv("DISTILL_LLM_MAX_TOKENS", "4000"))
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4000")

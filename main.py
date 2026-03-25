@@ -627,6 +627,7 @@ async def _distill_llm(project_name: str, curated_dir: str, nlm_notes: list[dict
                 {"role": "user", "content": prompt["user"]},
             ],
             api_base=LITELLM_URL,
+            api_key=os.getenv("LITELLM_MASTER_KEY", ""),
             timeout=DISTILL_LLM_TIMEOUT,
             max_tokens=DISTILL_LLM_MAX_TOKENS,
         )

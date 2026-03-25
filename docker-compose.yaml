@@ -20,6 +20,7 @@ services:
       - LOCAL_NODE=hanzo
       - DEVOPS_AGENT_KUBO=http://100.66.123.113:8091
       - DEVOPS_AGENT_SARIATU=http://100.76.110.104:8090
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
     volumes:
       - ./data:/app/data
       - /home/r0calex/ai-lab:/home/r0calex/ai-lab:ro
