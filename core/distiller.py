@@ -28,8 +28,12 @@ DISTILL_LLM_TIMEOUT = int(os.getenv("DISTILL_LLM_TIMEOUT", "120"))
 DISTILL_LLM_MAX_TOKENS = int(os.getenv("DISTILL_LLM_MAX_TOKENS", "4000"))
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 
-# Match top-level question numbers (1-5), with optional markdown headers (## 1. or **1.**)
-_ANSWER_RE = re.compile(r"^(?:#+ *)?(?:\*\*)?[1-5]\.(?:\*\*)?\s+", re.MULTILINE)
+# Match each top-level answer start: captures the number (1-5)
+# Strict: only matches at line start with optional markdown header prefix
+# The prompt asks for plain "1. " format, but we also accept "## 1." and "**1.**"
+_ANSWER_START_RE = re.compile(
+    r"^(?:#{1,3} *)?(?:\*\*)?([1-5])\.(?:\*\*)?\s+", re.MULTILINE
+)
 
 
 def compute_tier(project_name: str, curated_dir: str, registry_entry: dict) -> int:
@@ -91,7 +95,10 @@ def build_llm_prompt(
 
     parts.append(
         "\nAnswer each of the following questions. If the documentation doesn't "
-        "contain enough information to answer, say \"Insufficient documentation.\"\n"
+        "contain enough information to answer, say \"Insufficient documentation.\"\n\n"
+        "IMPORTANT: Use EXACTLY the format below. Start each answer with the number "
+        "followed by a period (e.g., '1. '). Do NOT use markdown headers, bold, or "
+        "sub-lists with numbers. Write each answer as a single paragraph.\n"
     )
     for i, q in enumerate(DISTILL_QUESTIONS, 1):
         parts.append(f"{i}. {q}")
@@ -108,17 +115,34 @@ def parse_llm_response(raw: str, project_name: str) -> list[dict]:
     if not raw or not raw.strip():
         return []
 
-    # Split by numbered pattern (1. 2. 3. etc.)
-    segments = _ANSWER_RE.split(raw.strip())
-    # First segment is empty or preamble before "1."
-    answers = [s.strip() for s in segments[1:] if s.strip()]
+    # Find the FIRST occurrence of each number 1-5 in order
+    # This handles LLMs that use sub-lists (e.g., "## 2." inside answer 1)
+    text = raw.strip()
+    matches = list(_ANSWER_START_RE.finditer(text))
 
-    if len(answers) != len(DISTILL_QUESTIONS):
+    # Keep only the first match for each sequential number 1-5
+    seen = set()
+    ordered_matches = []
+    for m in matches:
+        num = int(m.group(1))
+        expected_next = len(ordered_matches) + 1
+        if num == expected_next and num not in seen:
+            seen.add(num)
+            ordered_matches.append(m)
+
+    if len(ordered_matches) != len(DISTILL_QUESTIONS):
         logger.warning(
             f"LLM response for {project_name}: expected {len(DISTILL_QUESTIONS)} "
-            f"answers, got {len(answers)}"
+            f"sequential answers, found {len(ordered_matches)}"
         )
         return []
+
+    # Extract text between matches
+    answers = []
+    for i, m in enumerate(ordered_matches):
+        start = m.end()
+        end = ordered_matches[i + 1].start() if i + 1 < len(ordered_matches) else len(text)
+        answers.append(text[start:end].strip())
 
     notes = []
     for i, (question, answer) in enumerate(zip(DISTILL_QUESTIONS, answers)):
