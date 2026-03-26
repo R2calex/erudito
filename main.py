@@ -22,7 +22,7 @@ from core.scanner import compute_delta
 from core.indexer import (
     index_delta, ensure_collection, embed_text, search,
     upsert_points, generate_point_id,
-    COLLECTION_KNOWLEDGE, COLLECTION_NLM_NOTES,
+    COLLECTION_NLM_NOTES,
     search_by_filter,
 )
 from core.distiller import compute_tier, build_llm_prompt, parse_llm_response, DISTILL_QUESTIONS
@@ -435,37 +435,6 @@ async def _run_distill_all():
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _fallback_index_curated(project_name: str):
-    """Fallback: index curated docs directly to agent_knowledge when NLM is unavailable."""
-    curated_dir = os.path.join(CURATED_DIR, project_name)
-    curated_path = Path(curated_dir)
-    if not curated_path.is_dir():
-        return
-
-    delta_files = []
-    for md_file in sorted(curated_path.glob("*.md")):
-        delta_files.append({
-            "path": str(md_file),
-            "content": md_file.read_text(encoding="utf-8"),
-            "action": "modified",
-        })
-
-    if delta_files:
-        try:
-            loop = asyncio.get_event_loop()
-            delta = {
-                "project": project_name,
-                "old_hash": None,
-                "new_hash": "fallback",
-                "files": delta_files,
-            }
-            count = await loop.run_in_executor(None, index_delta, delta)
-            logger.info(f"Fallback indexed {count} points for {project_name}")
-            audit_log({"action": "fallback_index", "project": project_name, "points": count})
-        except Exception as e:
-            logger.error(f"Fallback indexing failed for {project_name}: {e}")
-
-
 # --- Tier-based Distillation ---
 
 def _fetch_existing_notes(project_name: str) -> list[dict]:
@@ -708,7 +677,6 @@ async def lifespan(app: FastAPI):
 
     # Ensure Qdrant collections exist
     try:
-        ensure_collection(COLLECTION_KNOWLEDGE)
         ensure_collection(COLLECTION_NLM_NOTES)
     except Exception as e:
         logger.warning(f"Qdrant init warning: {e}")
