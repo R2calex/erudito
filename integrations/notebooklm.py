@@ -443,12 +443,14 @@ async def delete_note(notebook_id: str, note_id: str) -> bool:
 
 
 async def query_notebook(notebook_id: str, query: str) -> str | None:
-    """Query a notebook. Returns answer text or None."""
+    """Query a notebook. Returns answer text or None. Raises on auth/error."""
     result = await _call_mcp("notebook_query", {
         "notebook_id": notebook_id,
         "query": query,
     })
     if result:
+        if isinstance(result, dict) and result.get("status") == "error":
+            raise Exception(result.get("error", "Unknown NLM error"))
         if isinstance(result, str):
             return result
         return result.get("answer") or result.get("response") or result.get("text") or str(result)

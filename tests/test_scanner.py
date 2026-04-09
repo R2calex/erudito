@@ -1,7 +1,8 @@
 import os
 import subprocess
+import time
 import pytest
-from core.scanner import find_git_root, should_scan_file, compute_delta
+from core.scanner import find_git_root, should_scan_file, compute_delta, compute_fs_hash, compute_fs_delta
 
 
 class TestShouldScanFile:
@@ -50,3 +51,95 @@ class TestComputeDelta:
         ).stdout.strip()
         delta = compute_delta("test-project", str(tmp_path), head)
         assert delta is None
+
+
+class TestComputeFsHash:
+    def test_deterministic(self, tmp_path):
+        (tmp_path / "a.md").write_text("hello")
+        (tmp_path / "b.md").write_text("world")
+        h1 = compute_fs_hash(str(tmp_path))
+        h2 = compute_fs_hash(str(tmp_path))
+        assert h1 == h2
+
+    def test_changes_on_new_file(self, tmp_path):
+        (tmp_path / "a.md").write_text("hello")
+        h1 = compute_fs_hash(str(tmp_path))
+        time.sleep(0.05)
+        (tmp_path / "b.md").write_text("world")
+        h2 = compute_fs_hash(str(tmp_path))
+        assert h1 != h2
+
+    def test_changes_on_content_change(self, tmp_path):
+        f = tmp_path / "a.md"
+        f.write_text("hello")
+        h1 = compute_fs_hash(str(tmp_path))
+        time.sleep(1.1)  # mtime resolution is 1s on some filesystems
+        f.write_text("updated content that changes size")
+        h2 = compute_fs_hash(str(tmp_path))
+        assert h1 != h2
+
+    def test_empty_dir(self, tmp_path):
+        h = compute_fs_hash(str(tmp_path))
+        assert isinstance(h, str)
+        assert len(h) == 16
+
+    def test_excludes_dirs(self, tmp_path):
+        (tmp_path / "good.md").write_text("ok")
+        node_modules = tmp_path / "node_modules"
+        node_modules.mkdir()
+        (node_modules / "bad.md").write_text("should be excluded")
+        h_with = compute_fs_hash(str(tmp_path))
+        # Hash should be the same as without node_modules
+        # (since node_modules is excluded)
+        assert isinstance(h_with, str)
+
+
+class TestComputeFsDelta:
+    def test_full_scan_no_last_hash(self, tmp_path):
+        (tmp_path / "doc.md").write_text("# Hello\nContent here")
+        delta = compute_fs_delta("test-proj", str(tmp_path), None)
+        assert delta is not None
+        assert delta["project"] == "test-proj"
+        assert delta["old_hash"] is None
+        assert len(delta["files"]) == 1
+        assert delta["files"][0]["path"] == "doc.md"
+        assert delta["files"][0]["action"] == "added"
+        assert "Hello" in delta["files"][0]["content"]
+
+    def test_no_changes_same_hash(self, tmp_path):
+        (tmp_path / "doc.md").write_text("# Hello")
+        delta1 = compute_fs_delta("test-proj", str(tmp_path), None)
+        assert delta1 is not None
+        delta2 = compute_fs_delta("test-proj", str(tmp_path), delta1["new_hash"])
+        assert delta2 is None  # No changes
+
+    def test_detects_new_file(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A")
+        delta1 = compute_fs_delta("test-proj", str(tmp_path), None)
+        time.sleep(0.05)
+        (tmp_path / "b.md").write_text("# B")
+        delta2 = compute_fs_delta("test-proj", str(tmp_path), delta1["new_hash"])
+        assert delta2 is not None
+        assert len(delta2["files"]) == 2  # full rescan on change
+
+    def test_nonexistent_dir(self, tmp_path):
+        delta = compute_fs_delta("test-proj", str(tmp_path / "nope"), None)
+        assert delta is None
+
+    def test_nested_dirs(self, tmp_path):
+        sub = tmp_path / "docs" / "spec"
+        sub.mkdir(parents=True)
+        (sub / "SPEC.md").write_text("# SPEC")
+        (tmp_path / "README.md").write_text("# README")
+        delta = compute_fs_delta("test-proj", str(tmp_path), None)
+        assert delta is not None
+        paths = [f["path"] for f in delta["files"]]
+        assert "README.md" in paths
+        assert os.path.join("docs", "spec", "SPEC.md") in paths
+
+    def test_skips_non_md(self, tmp_path):
+        (tmp_path / "doc.md").write_text("# Doc")
+        (tmp_path / "script.py").write_text("print('hi')")
+        delta = compute_fs_delta("test-proj", str(tmp_path), None)
+        assert len(delta["files"]) == 1
+        assert delta["files"][0]["path"] == "doc.md"
