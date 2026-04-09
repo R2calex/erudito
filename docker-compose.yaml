@@ -15,6 +15,15 @@ services:
       - ERUDITO_CONFIDENCE_THRESHOLD=0.75
       - SCAN_INTERVAL_MINUTES=15
       - DATA_DIR=/app/data
+      # Distill LLM (2026-04-09): switched from zen/minimax-m2.5 to go/minimax-m2.7
+      # because opencode.ai zen credit pool drained. m2.7 is a "thinking" reasoning
+      # model — needs more tokens for internal reasoning before producing content
+      # and a longer timeout than the non-thinking zen/m2.5. The openai/ prefix
+      # tells the litellm Python SDK to use OpenAI-compatible wire format when
+      # routing through the LiteLLM proxy (the SDK strips the prefix before sending).
+      - DISTILL_LLM_MODEL=openai/go/minimax-m2.7
+      - DISTILL_LLM_MAX_TOKENS=8000
+      - DISTILL_LLM_TIMEOUT=180
       - NLM_ENABLED=true
       - NLM_MCP_URL=http://notebooklm-mcp:8765/mcp
       - MAX_CONCURRENT_NLM=2
