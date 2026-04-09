@@ -12,13 +12,17 @@ from typing import Dict, List, Optional, Tuple
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4001/v1")
 LITELLM_KEY = os.getenv("LITELLM_API_KEY", "")
 
-# Model cascade: try local first, then free remote
+# Model cascade: try local first, then remote via active subscription pool.
 # Models tagged as "thinking" use reasoning_content and need higher token budgets.
+# NOTE: analyzer.py is currently dead code (not called from main.py). The cascade
+# is kept pointed at live `go/*` models so it stays usable if revived. The
+# previous zen/* entries were removed on 2026-04-09 when the zen credit pool
+# drained — see memory/feedback_use_go_not_zen.md.
 MODEL_CASCADE = [
     {"id": "lmstudio/qwen/qwen3.5-9b", "thinking": True},
-    {"id": "zen/nemotron-3-super-free", "thinking": False},
-    {"id": "zen/mimo-v2-flash-free",    "thinking": False},
-    {"id": "zen/minimax-m2.5",          "thinking": False},
+    {"id": "go/mimo-v2-pro",            "thinking": False},
+    {"id": "go/glm-5",                  "thinking": False},
+    {"id": "go/minimax-m2.7",           "thinking": True},
 ]
 
 # Thinking models spend tokens on internal reasoning before producing content.

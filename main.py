@@ -1,659 +1,1638 @@
+"""Erudito v3 — Knowledge Orchestration Agent with NotebookLM Integration.
+
+FastAPI application with modular domain separation.
+Background scan loop, confidence-based query routing, dual-write registry.
 """
-Erudito v1.0 — Knowledge Orchestration Agent for the KUBO AI-Lab mesh.
-
-Replaces index_docs.py with an intelligent curator that:
-- Scans git repos for changes (incremental via git diff)
-- Chunks and embeds documents
-- Curates Qdrant agent_knowledge collection (insert/update/delete)
-- Anti-RAG-poison filtering (regex-based)
-- Audit logging
-
-Run: uvicorn main:app --host 0.0.0.0 --port 8095
-"""
-
-import hashlib
+import asyncio
 import json
+import logging
 import os
 import re
-import subprocess
-import urllib.request
+import time
+import yaml
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-# ---------------------------------------------------------------------------
+from core.curator import curate_project
+from core.registry import Registry
+from core.scanner import compute_delta, compute_fs_delta
+from core.indexer import (
+    index_delta, ensure_collection, embed_text, embed_texts, search,
+    upsert_points, generate_point_id,
+    chunk_text,
+    delete_by_project_and_distill_source,
+    COLLECTION_NLM_NOTES,
+    search_by_filter,
+)
+from core.enricher import parse_frontmatter
+from core.distiller import compute_tier, build_llm_prompt, parse_llm_response, DISTILL_QUESTIONS
+from core.distiller import DISTILL_LLM_MODEL as _LLM_MODEL, DISTILL_LLM_TIMEOUT, DISTILL_LLM_MAX_TOKENS, LITELLM_URL
+from core.query import execute_query
+from integrations.sanitizer import sanitize_text
+from integrations import notebooklm as nlm
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logger = logging.getLogger("erudito")
+
 # Configuration
-# ---------------------------------------------------------------------------
-
-SCAN_SOURCES = [
-    {"path": os.path.expanduser("~/desarrollos_openclaw/claude_contracts"), "type": "docs", "node": "hanzo"},
-    {"path": os.path.expanduser("~/desarrollos_openclaw/opencode_contracts"), "type": "docs", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/infra-mcp"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/devops-agent"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/mesh-monitor"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/event-bus"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/node-reporter"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/qdrant-mcp"), "type": "code", "node": "hanzo"},
-    {"path": os.path.expanduser("~/ai-lab/erudito"), "type": "code", "node": "hanzo"},
-]
-
-REMOTE_SOURCES = [
-    {"path": "~/ai-lab/", "type": "code", "node": "kubo", "ssh": "r0calex@100.66.123.113"},
-    {"path": "~/ai-lab/", "type": "code", "node": "sariatu", "ssh": "sariatu"},
-]
-
-SCAN_EXTENSIONS = {".md", ".py", ".yml", ".yaml", ".json", ".sh", ".toml", ".cfg"}
-EXCLUDED_FILES = {".env", "credentials.json", "auth-profiles.json", "join_token.txt", "package-lock.json"}
-EXCLUDED_DIRS = {"node_modules", ".git", "__pycache__", ".pytest_cache", "venv", ".venv", "data"}
-
-POISON_PATTERNS = [
-    re.compile(r"password\s*[:=]\s*['\"]?[^\s'\"]{8,}", re.IGNORECASE),
-    re.compile(r"api[_-]?key\s*[:=]\s*['\"]?[a-zA-Z0-9_-]{20,}", re.IGNORECASE),
-    re.compile(r"token\s*[:=]\s*['\"]?[a-zA-Z0-9._-]{20,}", re.IGNORECASE),
-    re.compile(r"postgresql://[^:]+:[^@]+@"),
-    re.compile(r"sk-[a-zA-Z0-9]{20,}"),
-    re.compile(r"Bearer\s+[a-zA-Z0-9._-]{20,}"),
-    re.compile(r"BEGIN\s+(RSA|DSA|EC|OPENSSH)\s+PRIVATE\s+KEY"),
-]
-
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text:latest")
-COLLECTION = "agent_knowledge"
-SIMILARITY_THRESHOLD = 0.92
-
-CHUNK_SIZE = 800  # chars
-CHUNK_OVERLAP = 150
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-STATE_FILE = os.path.join(DATA_DIR, "scan_state.json")
+DATA_DIR = os.getenv("DATA_DIR", "data")
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_MINUTES", "15")) * 60
+REGISTRY_YAML = os.path.join(DATA_DIR, "registry.yaml")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.jsonl")
+REDIS_URL = os.getenv("REDIS_URL", None)
+MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "3"))
+CURATED_DIR = os.path.join(DATA_DIR, "curated")
+MAX_CONCURRENT_NLM = int(os.getenv("MAX_CONCURRENT_NLM", "2"))
+NLM_ENABLED = os.getenv("NLM_ENABLED", "false").lower() == "true"
+MAX_CONCURRENT_DISTILL = int(os.getenv("MAX_CONCURRENT_DISTILL", "5"))
+FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback.jsonl")
+FEEDBACK_THRESHOLD_PCT = int(os.getenv("FEEDBACK_THRESHOLD_PCT", "70"))
+FEEDBACK_WINDOW_SIZE = int(os.getenv("FEEDBACK_WINDOW_SIZE", "20"))
+INGESTED_DIR = os.path.join(DATA_DIR, "ingested")
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# Node → DevOps Agent URL mapping for remote file discovery
+NODE_DEVOPS_AGENTS = {
+    "kubo": os.getenv("DEVOPS_AGENT_KUBO", "http://100.66.123.113:8091"),
+    "sariatu": os.getenv("DEVOPS_AGENT_SARIATU", "http://100.76.110.104:8090"),
+}
+LOCAL_NODE = os.getenv("LOCAL_NODE", "hanzo")
+
+# Global state
+registry: Registry | None = None
+_scan_task: asyncio.Task | None = None
+_nlm_sync_task: asyncio.Task | None = None
+_scan_semaphore: asyncio.Semaphore | None = None
+_nlm_semaphore: asyncio.Semaphore | None = None
+_distill_semaphore: asyncio.Semaphore | None = None
+_coherence_cache: dict = {"score": None, "timestamp": None}
+_nlm_call_stats: dict = {"success": 0, "total": 0}
+_query_stats: dict = {"high": 0, "total": 0}
+_last_scan_time: str | None = None
+_auto_enriched_files: int = 0
+_total_scanned_files: int = 0
+
+# Error patterns that indicate NLM returned garbage instead of real answers
+_NLM_ERROR_PATTERNS = ["RESOURCE_EXHAUSTED", "error code", "status': 'error", "Google rejected"]
+
+
+def _is_nlm_error(answer: str) -> bool:
+    """Check if an NLM answer is actually an error response, not real knowledge."""
+    if not answer:
+        return True
+    answer_start = str(answer)[:200]
+    return any(p in answer_start for p in _NLM_ERROR_PATTERNS)
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-
-
-def _should_scan(filepath: str) -> bool:
-    """Return True if the file should be scanned based on extension/exclusion rules."""
-    basename = os.path.basename(filepath)
-    if basename in EXCLUDED_FILES:
-        return False
-    _, ext = os.path.splitext(basename)
-    if ext not in SCAN_EXTENSIONS:
-        return False
-    parts = filepath.replace("\\", "/").split("/")
-    for part in parts:
-        if part in EXCLUDED_DIRS:
-            return False
-    return True
-
-
-def _has_poison(content: str) -> bool:
-    """Check if content matches any anti-RAG-poison pattern."""
-    for pat in POISON_PATTERNS:
-        if pat.search(content):
-            return True
-    return False
-
-
-def _generate_point_id(source: str, chunk_index: int) -> int:
-    """Generate a deterministic 64-bit int ID from source + chunk_index."""
-    h = hashlib.md5(f"{source}:{chunk_index}".encode()).hexdigest()
-    return int(h[:16], 16)
-
-
-# ---------------------------------------------------------------------------
-# Scan state & audit
-# ---------------------------------------------------------------------------
-
-
-def load_scan_state() -> dict:
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def save_scan_state(state: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    return datetime.now(timezone.utc).isoformat()
 
 
 def audit_log(entry: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
+    """Append to JSONL audit file."""
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     entry["timestamp"] = _now_iso()
     with open(AUDIT_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Git scanner
-# ---------------------------------------------------------------------------
+class FeedbackRequest(BaseModel):
+    project: str
+    query: str
+    useful: bool
+    coherent: bool
+    logical: bool
 
 
-def _find_git_root(path: str) -> str | None:
-    """Find the git root for a path (may be a parent directory)."""
-    result = subprocess.run(
-        ["git", "-C", path, "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, timeout=5,
-    )
-    if result.returncode == 0:
-        return result.stdout.strip()
-    return None
+def _load_feedback(limit: int = 0) -> list[dict]:
+    """Load feedback entries from JSONL file."""
+    if not os.path.exists(FEEDBACK_FILE):
+        return []
+    entries = []
+    with open(FEEDBACK_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    if limit > 0:
+        return entries[-limit:]
+    return entries
 
 
-def scan_repo(source: dict) -> tuple[list[str], list[str], str]:
-    """Scan a git repo for changes since last scan.
+def _compute_feedback_stats(
+    entries: list[dict],
+    threshold: int = FEEDBACK_THRESHOLD_PCT,
+    window: int = FEEDBACK_WINDOW_SIZE,
+) -> dict:
+    """Compute per-project feedback stats from entries."""
+    from collections import defaultdict
+    by_project = defaultdict(list)
+    for e in entries:
+        by_project[e.get("project", "unknown")].append(e)
 
-    The scan path may be a subdirectory of a git repo. In that case,
-    git commands run from the git root, and file paths are filtered
-    to only include files under the scan path.
-
-    Returns (changed_files, deleted_files, head_commit).
-    Files are returned as paths relative to source["path"].
-    """
-    path = source["path"]
-    git_root = _find_git_root(path)
-    if not git_root:
-        raise RuntimeError(f"Not a git repo: {path}")
-
-    # If scan path is a subdir of git root, compute the prefix
-    abs_path = os.path.abspath(path)
-    abs_root = os.path.abspath(git_root)
-    if abs_path == abs_root:
-        subdir_prefix = ""
-    else:
-        subdir_prefix = os.path.relpath(abs_path, abs_root)
-        if not subdir_prefix.endswith("/"):
-            subdir_prefix += "/"
-
-    state = load_scan_state()
-    last_commit = state.get(path, {}).get("last_commit", "")
-
-    if last_commit:
-        # Check if last_commit still exists in the repo
-        check = subprocess.run(
-            ["git", "-C", git_root, "cat-file", "-t", last_commit],
-            capture_output=True, text=True, timeout=5,
-        )
-        if check.returncode != 0:
-            last_commit = ""
-
-    if last_commit:
-        cmd = ["git", "-C", git_root, "diff", "--name-only", last_commit, "HEAD"]
-        if subdir_prefix:
-            cmd.extend(["--", subdir_prefix])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        changed_files = [f for f in result.stdout.strip().split("\n") if f]
-
-        cmd_del = ["git", "-C", git_root, "diff", "--name-only", "--diff-filter=D", last_commit, "HEAD"]
-        if subdir_prefix:
-            cmd_del.extend(["--", subdir_prefix])
-        result_deleted = subprocess.run(cmd_del, capture_output=True, text=True, timeout=10)
-        deleted_files = [f for f in result_deleted.stdout.strip().split("\n") if f]
-    else:
-        cmd = ["git", "-C", git_root, "ls-files"]
-        if subdir_prefix:
-            cmd.append(subdir_prefix)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        changed_files = [f for f in result.stdout.strip().split("\n") if f]
-        deleted_files = []
-
-    # Strip subdir prefix so paths are relative to scan path
-    if subdir_prefix:
-        changed_files = [f[len(subdir_prefix):] for f in changed_files if f.startswith(subdir_prefix)]
-        deleted_files = [f[len(subdir_prefix):] for f in deleted_files if f.startswith(subdir_prefix)]
-
-    changed_files = [f for f in changed_files if _should_scan(f)]
-
-    head = subprocess.run(
-        ["git", "-C", git_root, "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=5,
-    ).stdout.strip()
-
-    return changed_files, deleted_files, head
-
-
-# ---------------------------------------------------------------------------
-# Chunking
-# ---------------------------------------------------------------------------
-
-
-def chunk_text(text: str, filename: str) -> list[dict]:
-    """Split text into overlapping chunks with metadata."""
-    chunks = []
-    step = CHUNK_SIZE - CHUNK_OVERLAP
-    if step <= 0:
-        step = CHUNK_SIZE
-    idx = 0
-    for i in range(0, len(text), step):
-        chunk = text[i : i + CHUNK_SIZE]
-        if len(chunk.strip()) < 50:
+    stats = {}
+    for project, items in by_project.items():
+        recent = items[-window:]
+        total = len(recent)
+        if total == 0:
             continue
-        chunks.append({
-            "text": chunk,
-            "source": filename,
-            "offset": i,
-            "chunk_index": idx,
-        })
-        idx += 1
-    return chunks
-
-
-# ---------------------------------------------------------------------------
-# Qdrant operations (raw REST API)
-# ---------------------------------------------------------------------------
-
-
-def _qdrant_request(path: str, data: dict | None = None, method: str | None = None, timeout: int = 15):
-    """Send a request to Qdrant REST API."""
-    url = f"{QDRANT_URL}{path}"
-    if data is not None:
-        payload = json.dumps(data).encode()
-        req = urllib.request.Request(
-            url, data=payload, method=method or "POST",
-            headers={"Content-Type": "application/json"},
-        )
-    else:
-        req = urllib.request.Request(url, method=method or "GET")
-    resp = urllib.request.urlopen(req, timeout=timeout)
-    return json.loads(resp.read())
-
-
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Get embeddings from Ollama. Process in batches to avoid timeouts."""
-    BATCH_SIZE = 32
-    all_embeddings = []
-    for i in range(0, len(texts), BATCH_SIZE):
-        batch = texts[i : i + BATCH_SIZE]
-        payload = json.dumps({"model": EMBED_MODEL, "input": batch}).encode()
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/embed",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        resp = urllib.request.urlopen(req, timeout=120)
-        data = json.loads(resp.read())
-        all_embeddings.extend(data["embeddings"])
-    return all_embeddings
-
-
-def upsert_points(points: list[dict]):
-    """Upsert a batch of points to Qdrant."""
-    if not points:
-        return
-    # Batch in groups of 100
-    BATCH = 100
-    for i in range(0, len(points), BATCH):
-        batch = points[i : i + BATCH]
-        _qdrant_request(
-            f"/collections/{COLLECTION}/points",
-            data={"points": batch},
-            method="PUT",
-            timeout=30,
-        )
-
-
-def delete_by_source(source_file: str) -> int:
-    """Delete all chunks from a specific source file."""
-    filter_payload = {
-        "filter": {"must": [{"key": "source", "match": {"value": source_file}}]},
-        "limit": 500,
-        "with_payload": False,
-    }
-    try:
-        result = _qdrant_request(
-            f"/collections/{COLLECTION}/points/scroll",
-            data=filter_payload,
-            method="POST",
-        )
-    except Exception:
-        return 0
-
-    points = result.get("result", {}).get("points", [])
-    if points:
-        ids = [p["id"] for p in points]
-        _qdrant_request(
-            f"/collections/{COLLECTION}/points/delete",
-            data={"points": ids},
-            method="POST",
-        )
-    return len(points)
-
-
-# ---------------------------------------------------------------------------
-# Main scan orchestrator
-# ---------------------------------------------------------------------------
-
-
-async def run_scan(sources: list[dict] | None = None) -> dict:
-    """Run a full scan cycle."""
-    if sources is None:
-        sources = SCAN_SOURCES
-
-    state = load_scan_state()
-    stats = {"scanned": 0, "inserted": 0, "updated": 0, "deleted": 0, "skipped": 0, "poisoned": 0, "errors": []}
-
-    for source in sources:
-        path = source["path"]
-        if not os.path.isdir(path):
-            stats["errors"].append(f"Directory not found: {path}")
-            continue
-
-        # Check if it's inside a git repo
-        if not _find_git_root(path):
-            stats["errors"].append(f"Not a git repo: {path}")
-            continue
-
-        try:
-            changed, deleted, head = scan_repo(source)
-        except Exception as e:
-            stats["errors"].append(f"Scan error {path}: {e}")
-            continue
-
-        # Handle deleted files
-        for f in deleted:
-            full_source = os.path.join(path, f)
-            count = delete_by_source(full_source)
-            stats["deleted"] += count
-            audit_log({"action": "delete", "source": full_source, "chunks_deleted": count})
-
-        # Process changed files
-        for f in changed:
-            full_path = os.path.join(path, f)
-            if not os.path.isfile(full_path):
-                continue
-
-            try:
-                with open(full_path, encoding="utf-8", errors="ignore") as fh:
-                    content = fh.read()
-            except Exception:
-                continue
-
-            # Anti-poison check
-            if _has_poison(content):
-                stats["poisoned"] += 1
-                audit_log({"action": "skip_poison", "source": full_path})
-                continue
-
-            # Chunk the file
-            chunks = chunk_text(content, full_path)
-            if not chunks:
-                stats["skipped"] += 1
-                continue
-
-            # Embed all chunks in batch
-            texts = [c["text"] for c in chunks]
-            try:
-                embeddings = embed_texts(texts)
-            except Exception as e:
-                stats["errors"].append(f"Embed error {full_path}: {e}")
-                audit_log({"action": "embed_error", "source": full_path, "error": str(e)})
-                continue
-
-            # Delete old chunks for this file (clean slate)
-            old_deleted = delete_by_source(full_path)
-            if old_deleted > 0:
-                stats["updated"] += 1
-            else:
-                stats["inserted"] += 1
-
-            # Build points for batch upsert
-            batch_points = []
-            for chunk, emb in zip(chunks, embeddings):
-                point_id = _generate_point_id(full_path, chunk["chunk_index"])
-                payload = {
-                    "source": full_path,
-                    "node": source.get("node", "unknown"),
-                    "type": source.get("type", "unknown"),
-                    "chunk_index": chunk["chunk_index"],
-                    "offset": chunk["offset"],
-                    "text": chunk["text"],
-                    "last_verified": _now_iso(),
-                }
-                batch_points.append({"id": point_id, "vector": emb, "payload": payload})
-
-            try:
-                upsert_points(batch_points)
-            except Exception as e:
-                stats["errors"].append(f"Upsert error {full_path}: {e}")
-                audit_log({"action": "upsert_error", "source": full_path, "error": str(e)})
-                continue
-
-            stats["scanned"] += 1
-
-        # Update scan state
-        state[path] = {"last_commit": head, "last_scan": _now_iso()}
-
-    save_scan_state(state)
-    audit_log({"action": "scan_complete", "stats": {k: v for k, v in stats.items() if k != "errors"}})
+        useful_pct = round(sum(1 for i in recent if i.get("useful")) / total * 100, 1)
+        coherent_pct = round(sum(1 for i in recent if i.get("coherent")) / total * 100, 1)
+        logical_pct = round(sum(1 for i in recent if i.get("logical")) / total * 100, 1)
+        needs_review = useful_pct < threshold or coherent_pct < threshold or logical_pct < threshold
+        stats[project] = {
+            "total": total,
+            "useful_pct": useful_pct,
+            "coherent_pct": coherent_pct,
+            "logical_pct": logical_pct,
+            "needs_review": needs_review,
+        }
     return stats
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
+async def _scan_loop():
+    """Background scan loop running every SCAN_INTERVAL seconds."""
+    while True:
+        try:
+            await _run_scan_all()
+        except Exception as e:
+            logger.error(f"Scan loop error: {e}")
+            audit_log({"action": "scan_error", "error": str(e)})
+        await asyncio.sleep(SCAN_INTERVAL)
 
-app = FastAPI(
-    title="Erudito",
-    version="1.0.0",
-    description="Knowledge Orchestration Agent — KUBO AI-Lab",
-)
 
+async def _run_scan_all():
+    """Scan all projects with max concurrency limit.
+
+    Per-KB scan_interval_seconds is honored here (not in _scan_project) so that
+    manual POST /scan/{project} calls always run regardless of the rate limit.
+    """
+    global _last_scan_time, _scan_semaphore
+    if not registry:
+        return
+    if _scan_semaphore is None:
+        _scan_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+
+    now_ts = time.time()
+
+    def _is_rate_limited(name: str) -> bool:
+        entry = registry.get(name)
+        if not entry:
+            return False
+        interval = entry.get("scan_interval_seconds")
+        if not interval:
+            return False
+        last_sync = entry.get("last_sync")
+        if not last_sync:
+            return False  # never scanned → don't rate-limit first run
+        try:
+            last_ts = datetime.fromisoformat(last_sync).timestamp()
+        except (TypeError, ValueError):
+            return False
+        return (now_ts - last_ts) < interval
+
+    async def _bounded_scan(name):
+        async with _scan_semaphore:
+            await _scan_project(name)
+
+    tasks = []
+    for name in registry.list_all():
+        if _is_rate_limited(name):
+            logger.debug(f"Skipping {name}: per-KB scan_interval not yet elapsed")
+            continue
+        tasks.append(_bounded_scan(name))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _last_scan_time = _now_iso()
+
+
+async def _pull_remote_docs(project_name: str, entry: dict) -> bool:
+    """Pull .md files from a remote node's devops-agent into data/ingested/{project}/."""
+    node = entry.get("node", "")
+    agent_url = NODE_DEVOPS_AGENTS.get(node)
+    if not agent_url:
+        logger.warning(f"No devops-agent URL for node '{node}' (project {project_name})")
+        return False
+
+    repo_path = entry.get("path", "")
+    if not repo_path:
+        return False
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: List .md files on the remote node
+            resp = await client.get(f"{agent_url}/files", params={"path": repo_path})
+            resp.raise_for_status()
+            file_list = resp.json().get("files", [])
+
+            if not file_list:
+                logger.info(f"No .md files found on {node} for {project_name}")
+                return False
+
+            # Step 2: Get content of all files
+            file_paths = [f["path"] for f in file_list]
+            resp2 = await client.post(f"{agent_url}/files/content", json={
+                "path": repo_path,
+                "files": file_paths,
+            })
+            resp2.raise_for_status()
+            remote_files = resp2.json().get("files", [])
+
+            # Step 3: Store in ingested dir
+            ingest_dir = Path(INGESTED_DIR) / project_name
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            stored = 0
+            for f in remote_files:
+                safe_name = os.path.basename(f["path"])
+                (ingest_dir / safe_name).write_text(f["content"], encoding="utf-8")
+                stored += 1
+
+            logger.info(f"Pulled {stored} files from {node}:{repo_path} for {project_name}")
+            audit_log({"action": "remote_pull", "project": project_name, "node": node, "files": stored})
+            return stored > 0
+
+    except Exception as e:
+        logger.warning(f"Remote pull failed for {project_name} from {node}: {e}")
+        return False
+
+
+# --------------------------------------------------------------------------
+# Atomic KB pipeline (Phase 1, 2026-04-09)
+# --------------------------------------------------------------------------
+#
+# An "atomic" knowledge_base bypasses the curator (no feature merging) and the
+# NLM/LLM distillers. Each source file is embedded 1:1 into Qdrant with rich
+# payload metadata: memory_type (from frontmatter `type`), linked_project
+# (auto-derived from filename or explicit), distill_source="atomic". This is
+# designed for Claude Code auto-memory and similar atomic note collections
+# where each .md is a self-contained unit and feature-merging by filename
+# prefix would catastrophically lose granularity (e.g. 10 `project_*.md` from
+# different projects collapsing into one curated file).
+#
+# Wipe-and-rebuild semantics: every successful delta deletes all existing
+# atomic points for the project and re-indexes the current file set, so file
+# deletions and renames don't leave orphans behind.
+#
+# See docs/BACKLOG.md "Auto-Memory Integration" for the full design.
+
+ATOMIC_DISTILL_SOURCE = "atomic"
+_LINKED_PROJECT_RE = re.compile(r"^(?:project|feedback)_(.+)\.md$", re.IGNORECASE)
+
+
+def _derive_linked_project(filename: str, fm: dict) -> str | None:
+    """Derive linked_project for an atomic KB source file.
+
+    Priority:
+    1. Explicit frontmatter `linked_project` field (must match a registered project)
+    2. Filename-derived match: walk from longest to shortest prefix until a
+       registered project is found
+
+    Walking shortens at each `_` or `-` separator, so e.g.
+    `project_erudito_agentic.md` tries:
+        erudito_agentic → erudito-agentic → erudito (MATCH if `erudito` is registered)
+
+    Returns the canonical registry project name, or None if no match
+    (the file is still indexed, just without a cross-project link).
+    """
+    if not registry:
+        return None
+    explicit = fm.get("linked_project") if isinstance(fm, dict) else None
+    if explicit and registry.get(explicit):
+        return explicit
+    m = _LINKED_PROJECT_RE.match(os.path.basename(filename))
+    if not m:
+        return None
+    candidate = m.group(1).strip().lower()
+    parts = re.split(r"[-_]", candidate)
+    parts = [p for p in parts if p]  # drop empties from leading/trailing separators
+    if not parts:
+        return None
+    # Walk from longest prefix to single first token
+    for i in range(len(parts), 0, -1):
+        sub_underscore = "_".join(parts[:i])
+        if registry.get(sub_underscore):
+            return sub_underscore
+        sub_hyphen = "-".join(parts[:i])
+        if sub_hyphen != sub_underscore and registry.get(sub_hyphen):
+            return sub_hyphen
+    return None
+
+
+def _index_atomic_kb(project_name: str, files: list[dict]) -> int:
+    """Embed each source file as 1+ Qdrant chunks with rich payload metadata.
+
+    Returns total chunks upserted. Wipes existing atomic points for the
+    project before indexing so deletes/renames don't leave orphans.
+    """
+    # Wipe previous atomic points (scoped to distill_source="atomic" — we never
+    # touch points produced by other backends).
+    try:
+        delete_by_project_and_distill_source(project_name, ATOMIC_DISTILL_SOURCE)
+    except Exception as e:
+        logger.warning(f"atomic wipe failed for {project_name}: {e}")
+
+    total_chunks = 0
+    linked_count = 0
+    for file_info in files:
+        if file_info.get("action") == "deleted":
+            continue
+        content = file_info.get("content", "")
+        if not content:
+            continue
+        source = file_info["path"]
+
+        fm, _body = parse_frontmatter(content)
+        memory_type = (fm.get("type") if isinstance(fm, dict) else None) or "doc"
+        linked_project = _derive_linked_project(source, fm)
+        if linked_project:
+            linked_count += 1
+
+        chunks = chunk_text(content, source)
+        if not chunks:
+            continue
+        texts = [c["text"] for c in chunks]
+        try:
+            embeddings = embed_texts(texts)
+        except Exception as e:
+            logger.warning(f"atomic embed failed for {project_name}/{source}: {e}")
+            continue
+
+        points = []
+        for chunk, embedding in zip(chunks, embeddings):
+            point_id = generate_point_id(
+                f"{ATOMIC_DISTILL_SOURCE}:{project_name}:{source}",
+                chunk["chunk_index"],
+            )
+            payload = {
+                "text": chunk["text"],
+                "source": source,
+                "project": project_name,
+                "chunk_index": chunk["chunk_index"],
+                "offset": chunk["offset"],
+                "distill_source": ATOMIC_DISTILL_SOURCE,
+                "memory_type": memory_type,
+                "type": "atomic_kb",
+                "canonical": True,
+            }
+            if linked_project:
+                payload["linked_project"] = linked_project
+            points.append({
+                "id": point_id,
+                "vector": embedding,
+                "payload": payload,
+            })
+
+        try:
+            upsert_points(points, collection=COLLECTION_NLM_NOTES)
+            total_chunks += len(points)
+        except Exception as e:
+            logger.warning(f"atomic upsert failed for {project_name}/{source}: {e}")
+
+    logger.info(
+        f"Atomic indexed {project_name}: {total_chunks} chunks from "
+        f"{sum(1 for f in files if f.get('action') != 'deleted')} files "
+        f"({linked_count} linked to other projects)"
+    )
+    return total_chunks
+
+
+async def _process_fs_project(
+    project_name: str, source_dir: str, entry: dict, node: str,
+    extensions: set[str] | None = None,
+):
+    """Process a filesystem-based project (ingested or knowledge_base).
+
+    Runs: delta detection → sanitize → (atomic embed | curate → tier) → update registry.
+    """
+    global _auto_enriched_files, _total_scanned_files
+
+    is_atomic = bool(entry.get("atomic"))
+    exclude_patterns = entry.get("exclude_patterns") or []
+    use_content_hash = bool(entry.get("content_hash"))
+
+    delta = compute_fs_delta(
+        project_name,
+        source_dir,
+        entry.get("last_hash"),
+        extensions=extensions,
+        exclude_patterns=exclude_patterns,
+        content_hash=use_content_hash,
+    )
+    if not delta:
+        logger.info(f"No changes for fs project {project_name}")
+        return
+
+    label = "atomic_kb" if is_atomic else entry.get("type", "ingested")
+    logger.info(f"FS delta for {project_name} ({label}): {len(delta['files'])} files")
+    audit_log({"action": "delta_detected", "project": project_name,
+               "files": len(delta["files"]), "source": f"{label}:{node}"})
+
+    # Sanitize
+    for file_info in delta["files"]:
+        if file_info["content"]:
+            result = await sanitize_text(file_info["content"])
+            file_info["content"] = result["sanitized"]
+
+    # Track enrichment
+    for f in delta["files"]:
+        if f["action"] != "deleted":
+            _total_scanned_files += 1
+            if f.get("auto_enriched"):
+                _auto_enriched_files += 1
+
+    # --- Atomic path: skip curator + NLM, embed each source file 1:1 ---
+    if is_atomic:
+        try:
+            chunks_indexed = _index_atomic_kb(project_name, delta["files"])
+        except Exception as e:
+            logger.error(f"Atomic indexing failed for {project_name}: {e}")
+            audit_log({"action": "atomic_index_error", "project": project_name, "error": str(e)})
+            return
+        live_files = len([f for f in delta["files"] if f["action"] != "deleted"])
+        registry.update_sync(project_name, delta["new_hash"], doc_count=live_files)
+        registry.update_fields(
+            project_name,
+            curation_status="atomic",
+            curated_at=_now_iso(),
+            curated_files=live_files,
+            computed_tier=2,  # Tier 2 semantically: LLM-grade quality, no NLM
+            last_distill=_now_iso(),
+            status="synced",
+        )
+        audit_log({
+            "action": "atomic_index_complete",
+            "project": project_name,
+            "files": live_files,
+            "chunks": chunks_indexed,
+            "source": f"{label}:{node}",
+        })
+        return
+
+    # --- Standard path: curate → tier ---
+    try:
+        curation_result = curate_project(project_name, source_dir, delta["files"], CURATED_DIR)
+        if curation_result.success and curation_result.curated_files > 0:
+            proj = registry._data["projects"].get(project_name)
+            if proj:
+                proj["curation_status"] = "curated"
+                proj["curated_at"] = _now_iso()
+                proj["curated_files"] = curation_result.curated_files
+                registry._persist()
+            registry.update_sync(project_name, delta["new_hash"],
+                                 doc_count=len([f for f in delta["files"] if f["action"] != "deleted"]))
+            audit_log({"action": "curation_complete", "project": project_name,
+                       "features": curation_result.features, "source": f"{label}:{node}"})
+            logger.info(f"Curated {project_name} ({label}/{node}): {curation_result.curated_files} features")
+            computed = compute_tier(project_name, os.path.join(CURATED_DIR, project_name), entry)
+            registry.update_fields(project_name, computed_tier=computed)
+            logger.info(f"Tier for {project_name}: {computed} ({curation_result.curated_files} features)")
+    except Exception as e:
+        logger.error(f"Curation failed for {label} {project_name}: {e}")
+
+
+async def _scan_project(project_name: str):
+    """Scan a single project for changes. Handles both local and remote projects."""
+    global _auto_enriched_files, _total_scanned_files
+
+    entry = registry.get(project_name)
+    if not entry:
+        return
+
+    node = entry.get("node", LOCAL_NODE)
+    is_remote = node != LOCAL_NODE and node in NODE_DEVOPS_AGENTS
+    project_path = os.path.expanduser(entry.get("path", ""))
+    is_ingested = INGESTED_DIR in project_path or (
+        Path(INGESTED_DIR) / project_name
+    ).is_dir()
+    is_knowledge_base = entry.get("type") == "knowledge_base"
+
+    # Route 0: Knowledge base (plain folder, no git)
+    if is_knowledge_base:
+        kb_dir = os.path.expanduser(entry.get("path", ""))
+        if not os.path.isdir(kb_dir):
+            logger.warning(f"Knowledge base dir not found for {project_name}: {kb_dir}")
+            return
+        from core.scanner import KB_EXTENSIONS
+        await _process_fs_project(project_name, kb_dir, entry, node, extensions=KB_EXTENSIONS)
+        return
+
+    # Route 1: Ingested project (files on disk, no git repo)
+    if is_ingested:
+        ingest_dir = Path(INGESTED_DIR) / project_name
+        if not ingest_dir.is_dir():
+            logger.warning(f"Ingested dir not found for {project_name}: {ingest_dir}")
+            return
+        await _process_fs_project(project_name, str(ingest_dir), entry, node)
+        return
+
+    # Route 2: Remote project (pull via devops-agent, then curate)
+    if is_remote:
+        # Remote project: pull docs via devops-agent, then curate from ingested dir
+        pulled = await _pull_remote_docs(project_name, entry)
+        if not pulled:
+            return
+
+        ingest_dir = Path(INGESTED_DIR) / project_name
+        delta_files = []
+        for md_file in sorted(ingest_dir.glob("*.md")):
+            delta_files.append({
+                "path": md_file.name,
+                "content": md_file.read_text(encoding="utf-8"),
+                "action": "added",
+            })
+
+        if not delta_files:
+            return
+
+        logger.info(f"Remote delta for {project_name}: {len(delta_files)} files from {node}")
+        audit_log({"action": "delta_detected", "project": project_name,
+                   "files": len(delta_files), "source": f"remote:{node}"})
+
+        # Sanitize
+        for file_info in delta_files:
+            if file_info["content"]:
+                result = await sanitize_text(file_info["content"])
+                file_info["content"] = result["sanitized"]
+
+        # Curate
+        try:
+            curation_result = curate_project(project_name, str(ingest_dir), delta_files, CURATED_DIR)
+            if curation_result.success and curation_result.curated_files > 0:
+                proj = registry._data["projects"].get(project_name)
+                if proj:
+                    proj["curation_status"] = "curated"
+                    proj["curated_at"] = _now_iso()
+                    proj["curated_files"] = curation_result.curated_files
+                    proj["doc_count"] = len(delta_files)
+                    registry._persist()
+                audit_log({"action": "curation_complete", "project": project_name,
+                           "features": curation_result.features, "source": f"remote:{node}"})
+                logger.info(f"Curated {project_name} (remote/{node}): {curation_result.curated_files} features")
+                # Compute tier from curated output
+                computed = compute_tier(project_name, os.path.join(CURATED_DIR, project_name), entry)
+                registry.update_fields(project_name, computed_tier=computed)
+                logger.info(f"Tier for {project_name}: {computed} ({curation_result.curated_files} features)")
+        except Exception as e:
+            logger.error(f"Curation failed for remote {project_name}: {e}")
+        return
+
+    # Route 3: Local project (standard git scan)
+    repo_path = os.path.expanduser(entry["path"])
+    if not os.path.isdir(repo_path):
+        logger.warning(f"Path not found for {project_name}: {repo_path}")
+        return
+
+    delta = compute_delta(project_name, repo_path, entry.get("last_hash"))
+    if not delta:
+        return  # No changes
+
+    logger.info(f"Delta detected for {project_name}: {len(delta['files'])} files changed")
+    audit_log({"action": "delta_detected", "project": project_name, "files": len(delta["files"])})
+
+    # Sanitize all files in the delta
+    for file_info in delta["files"]:
+        if file_info["content"]:
+            result = await sanitize_text(file_info["content"])
+            file_info["content"] = result["sanitized"]
+            if result["masked_count"] > 0:
+                logger.info(f"Sanitized {result['masked_count']} secrets in {file_info['path']}")
+
+    # Track auto-enrichment for metadata compliance metric
+    for f in delta["files"]:
+        if f["action"] != "deleted":
+            _total_scanned_files += 1
+            if f.get("auto_enriched"):
+                _auto_enriched_files += 1
+
+    # Run Curator (replaces direct indexing)
+    try:
+        curation_result = curate_project(
+            project_name, repo_path, delta["files"], CURATED_DIR
+        )
+        if curation_result.success and curation_result.curated_files > 0:
+            project = registry._data["projects"].get(project_name)
+            if project:
+                project["curation_status"] = "curated"
+                project["curated_at"] = _now_iso()
+                project["curated_files"] = curation_result.curated_files
+                registry._persist()
+            registry.update_sync(project_name, delta["new_hash"],
+                                 doc_count=len([f for f in delta["files"] if f["action"] != "deleted"]))
+            audit_log({
+                "action": "curation_complete",
+                "project": project_name,
+                "features": curation_result.features,
+                "curated_files": curation_result.curated_files,
+            })
+            logger.info(f"Curated {project_name}: {curation_result.curated_files} features")
+            # Compute tier from curated output
+            computed = compute_tier(project_name, os.path.join(CURATED_DIR, project_name), entry)
+            registry.update_fields(project_name, computed_tier=computed)
+            logger.info(f"Tier for {project_name}: {computed} ({curation_result.curated_files} features)")
+        elif curation_result.errors:
+            project = registry._data["projects"].get(project_name)
+            if project:
+                project["curation_status"] = "error"
+                registry._persist()
+            audit_log({
+                "action": "curation_error",
+                "project": project_name,
+                "errors": curation_result.errors,
+            })
+    except Exception as e:
+        logger.error(f"Curation failed for {project_name}: {e}")
+        audit_log({"action": "curation_error", "project": project_name, "error": str(e)})
+
+    # Cleanup curated files for features with all sources deleted
+    deleted_files = [f["path"] for f in delta["files"] if f["action"] == "deleted"]
+    if deleted_files:
+        curated_project_dir = Path(CURATED_DIR) / project_name
+        if curated_project_dir.is_dir():
+            for curated_file in curated_project_dir.glob("*.md"):
+                try:
+                    content = curated_file.read_text(encoding="utf-8")
+                    if content.startswith("---"):
+                        fm_end = content.index("---", 3)
+                        fm = yaml.safe_load(content[3:fm_end])
+                        sources = fm.get("source_files", [])
+                        if sources and all(s in deleted_files for s in sources):
+                            curated_file.unlink()
+                            audit_log({"action": "curation_cleanup", "project": project_name, "file": curated_file.name})
+                            logger.info(f"Cleaned up curated file: {curated_file.name}")
+                except Exception as e:
+                    logger.warning(f"Cleanup check failed for {curated_file}: {e}")
+
+
+async def _distill_loop():
+    """Background distillation loop. Runs offset from scan loop."""
+    global _distill_semaphore
+    await asyncio.sleep(300)  # 5-minute offset from scan loop
+    while True:
+        try:
+            await _run_distill_all()
+        except Exception as e:
+            logger.error(f"Distill loop error: {e}")
+            audit_log({"action": "distill_loop_error", "error": str(e)})
+        await asyncio.sleep(SCAN_INTERVAL)
+
+
+async def _run_distill_all():
+    """Distill all curated projects, respecting tiers and concurrency."""
+    global _nlm_semaphore, _distill_semaphore
+    if not registry:
+        return
+    if _nlm_semaphore is None:
+        _nlm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NLM)
+    if _distill_semaphore is None:
+        _distill_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DISTILL)
+
+    candidates = []
+    for name in registry.list_all():
+        entry = registry.get(name)
+        if not entry:
+            continue
+        # Atomic projects are indexed inline in the scan loop (no curate, no NLM,
+        # no LLM distillation step). Skip them entirely from the distill loop.
+        if entry.get("atomic"):
+            continue
+        if entry.get("curation_status") != "curated":
+            continue
+        # Skip if already distilled after last curation
+        last_distill = entry.get("last_distill")
+        curated_at = entry.get("curated_at")
+        if last_distill and curated_at and last_distill >= curated_at:
+            continue
+        candidates.append(name)
+
+    if not candidates:
+        return
+
+    logger.info(f"Distill loop: {len(candidates)} projects to process")
+
+    async def _bounded_distill(name):
+        entry = registry.get(name)
+        tier = entry.get("tier") or entry.get("computed_tier", 3)
+        needs_nlm = (tier == 1 and not entry.get("nlm_baseline"))
+
+        if needs_nlm and NLM_ENABLED:
+            async with _nlm_semaphore:
+                await _distill_project(name)
+        else:
+            async with _distill_semaphore:
+                await _distill_project(name)
+
+    tasks = [_bounded_distill(name) for name in candidates]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# --- Tier-based Distillation ---
+
+def _fetch_existing_notes(project_name: str) -> list[dict]:
+    """Fetch existing distilled notes from Qdrant nlm_notes collection."""
+    try:
+        results = search_by_filter(
+            COLLECTION_NLM_NOTES,
+            {"project": project_name, "canonical": True},
+            limit=10,
+        )
+        return [
+            {"question": r["payload"]["question"], "answer": r["payload"]["text"]}
+            for r in results if "question" in r.get("payload", {})
+        ]
+    except Exception as e:
+        logger.warning(f"Failed to fetch existing notes for {project_name}: {e}")
+        return []
+
+
+async def _distill_project(project_name: str, force_nlm: bool = False):
+    """Dispatch distillation based on project tier."""
+    entry = registry.get(project_name)
+    if not entry:
+        return
+    curated_dir = os.path.join(CURATED_DIR, project_name)
+    tier = entry.get("tier") or entry.get("computed_tier", 3)
+
+    if force_nlm:
+        if not NLM_ENABLED:
+            raise ValueError("NLM is disabled (NLM_ENABLED=false)")
+        if nlm.is_circuit_open():
+            raise ValueError("NLM circuit breaker is tripped")
+        try:
+            await _distill_nlm(project_name, curated_dir)
+        except Exception as e:
+            logger.error(f"force_nlm failed for {project_name}: {e}")
+            raise
+        return
+
+    if tier == 1:
+        if not entry.get("nlm_baseline"):
+            if NLM_ENABLED and not nlm.is_circuit_open():
+                try:
+                    await _distill_nlm(project_name, curated_dir)
+                except Exception as e:
+                    logger.warning(f"NLM unavailable for {project_name} baseline, falling back to LLM: {e}")
+                    await _distill_llm(project_name, curated_dir, nlm_notes=None)
+            else:
+                logger.info(f"NLM not available for {project_name} baseline, using LLM")
+                await _distill_llm(project_name, curated_dir, nlm_notes=None)
+        else:
+            existing_notes = _fetch_existing_notes(project_name)
+            await _distill_llm(project_name, curated_dir, nlm_notes=existing_notes)
+    elif tier == 2:
+        await _distill_llm(project_name, curated_dir, nlm_notes=None)
+    else:
+        await _distill_direct(project_name, curated_dir)
+
+
+async def _distill_nlm(project_name: str, curated_dir: str):
+    """Distill via NotebookLM (Tier 1 initial or force_nlm)."""
+    entry = registry.get(project_name)
+    notebook_id = entry.get("notebook_id")
+
+    if not notebook_id:
+        notebook_id = await nlm.ensure_notebook(f"AI-Lab: {project_name}")
+        if notebook_id:
+            registry.update_fields(project_name, notebook_id=notebook_id)
+            logger.info(f"Created notebook for {project_name}: {notebook_id}")
+        else:
+            registry.update_fields(
+                project_name,
+                nlm_consecutive_failures=entry.get("nlm_consecutive_failures", 0) + 1,
+            )
+            raise Exception(f"Failed to create notebook for {project_name}")
+
+    _nlm_call_stats["total"] += 1
+    result = await nlm.run_nlm_cycle(notebook_id, curated_dir, project_name=project_name)
+
+    if result["success"]:
+        _nlm_call_stats["success"] += 1
+        indexed = 0
+        for i, note in enumerate(result["notes"]):
+            if _is_nlm_error(note.get("answer", "")):
+                logger.warning(f"Skipping contaminated NLM response for {project_name}")
+                continue
+            embedding = embed_text(f"{note['question']} {note['answer'][:200]}")
+            point_id = generate_point_id(f"nlm:{project_name}:{note['question'][:50]}", 0)
+            is_canonical = note.get("question", "") in DISTILL_QUESTIONS
+            upsert_points([{
+                "id": point_id,
+                "vector": embedding,
+                "payload": {
+                    "text": note["answer"],
+                    "question": note["question"],
+                    "source": "nlm",
+                    "distill_source": "nlm",
+                    "project": project_name,
+                    "from_nlm": True,
+                    "type": "qa",
+                    "model": "notebooklm",
+                    "canonical": is_canonical,
+                    "chunk_index": i,
+                },
+            }], collection=COLLECTION_NLM_NOTES)
+            indexed += 1
+
+        if indexed > 0:
+            registry.update_fields(
+                project_name,
+                nlm_baseline=True,
+                last_distill=_now_iso(),
+                last_nlm_distill=_now_iso(),
+                nlm_consecutive_failures=0,
+                status="synced",
+            )
+        else:
+            logger.warning(f"NLM returned success but all notes filtered for {project_name}")
+            registry.update_fields(
+                project_name,
+                nlm_consecutive_failures=entry.get("nlm_consecutive_failures", 0) + 1,
+            )
+        audit_log({"action": "distill_nlm", "project": project_name, "notes": indexed})
+    else:
+        registry.update_fields(
+            project_name,
+            nlm_consecutive_failures=entry.get("nlm_consecutive_failures", 0) + 1,
+        )
+        raise Exception(f"NLM cycle failed for {project_name}")
+
+
+async def _distill_llm(project_name: str, curated_dir: str, nlm_notes: list[dict] | None = None):
+    """Distill via LLM (Tier 2, or Tier 1 with baseline)."""
+    import litellm
+
+    curated_path = Path(curated_dir)
+    if not curated_path.exists():
+        logger.warning(f"No curated dir for {project_name}: {curated_dir}")
+        return
+
+    curated_files = []
+    for md_file in sorted(curated_path.glob("*.md")):
+        curated_files.append({
+            "name": md_file.name,
+            "content": md_file.read_text(encoding="utf-8"),
+        })
+
+    if not curated_files:
+        logger.warning(f"No curated files for {project_name}")
+        return
+
+    prompt = build_llm_prompt(project_name, curated_files, nlm_notes)
+
+    try:
+        response = await litellm.acompletion(
+            model=_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": prompt["system"]},
+                {"role": "user", "content": prompt["user"]},
+            ],
+            api_base=LITELLM_URL,
+            api_key=os.getenv("LITELLM_MASTER_KEY", ""),
+            timeout=DISTILL_LLM_TIMEOUT,
+            max_tokens=DISTILL_LLM_MAX_TOKENS,
+        )
+        raw_answer = response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"LLM distill failed for {project_name}: {e}")
+        audit_log({"action": "distill_llm_error", "project": project_name, "error": str(e)})
+        return
+
+    # Guard against error responses from LLM gateway
+    if _is_nlm_error(raw_answer):
+        logger.warning(f"LLM returned error response for {project_name}: {raw_answer[:100]}")
+        audit_log({"action": "distill_llm_error_response", "project": project_name})
+        return
+
+    notes = parse_llm_response(raw_answer, project_name)
+    if not notes:
+        logger.warning(f"LLM response unparseable for {project_name}")
+        audit_log({"action": "distill_llm_parse_error", "project": project_name})
+        return
+
+    for note in notes:
+        embedding = embed_text(f"{note['question']} {note['text'][:200]}")
+        point_id = generate_point_id(f"llm:{project_name}:{note['question'][:50]}", 0)
+        upsert_points([{
+            "id": point_id,
+            "vector": embedding,
+            "payload": note,
+        }], collection=COLLECTION_NLM_NOTES)
+
+    registry.update_fields(project_name, last_distill=_now_iso(), status="synced")
+    audit_log({"action": "distill_llm", "project": project_name, "notes": len(notes),
+               "model": _LLM_MODEL, "had_nlm_context": nlm_notes is not None})
+
+
+async def _distill_direct(project_name: str, curated_dir: str):
+    """Distill by directly embedding curated docs (Tier 3)."""
+    curated_path = Path(curated_dir)
+    if not curated_path.exists():
+        logger.warning(f"No curated dir for {project_name}: {curated_dir}")
+        return
+
+    indexed = 0
+    for i, md_file in enumerate(sorted(curated_path.glob("*.md"))):
+        content = md_file.read_text(encoding="utf-8")
+        feature_name = md_file.stem
+        embedding = embed_text(content[:2000])
+        point_id = generate_point_id(f"direct:{project_name}:{feature_name}", 0)
+        upsert_points([{
+            "id": point_id,
+            "vector": embedding,
+            "payload": {
+                "text": content,
+                "question": f"Project documentation: {feature_name}",
+                "source": "direct",
+                "distill_source": "direct",
+                "project": project_name,
+                "type": "curated_doc",
+                "model": None,
+                "canonical": True,
+                "chunk_index": i,
+            },
+        }], collection=COLLECTION_NLM_NOTES)
+        indexed += 1
+
+    registry.update_fields(project_name, last_distill=_now_iso(), status="synced")
+    audit_log({"action": "distill_direct", "project": project_name, "docs": indexed})
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: init services and start background loops."""
+    global registry, _scan_task, _nlm_sync_task, _scan_semaphore, _nlm_semaphore
+
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(CURATED_DIR).mkdir(parents=True, exist_ok=True)
+    registry = Registry(yaml_path=REGISTRY_YAML, redis_url=REDIS_URL)
+
+    # Ensure Qdrant collections exist
+    try:
+        ensure_collection(COLLECTION_NLM_NOTES)
+    except Exception as e:
+        logger.warning(f"Qdrant init warning: {e}")
+
+    # Init concurrency control and start background loops
+    _scan_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+    _nlm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NLM)
+    _scan_task = asyncio.create_task(_scan_loop())
+    _nlm_sync_task = asyncio.create_task(_distill_loop())
+    logger.info(f"Distill loop started. NLM enabled: {NLM_ENABLED}, max concurrent NLM: {MAX_CONCURRENT_NLM}, max concurrent distill: {MAX_CONCURRENT_DISTILL}")
+    logger.info(f"Max concurrent scans: {MAX_CONCURRENT_SCANS}")
+    logger.info(f"Erudito v3 started. Scan interval: {SCAN_INTERVAL}s")
+
+    yield
+
+    # Cleanup
+    if _scan_task:
+        _scan_task.cancel()
+    if _nlm_sync_task:
+        _nlm_sync_task.cancel()
+
+
+app = FastAPI(title="Erudito v3", version="3.0.0", lifespan=lifespan)
+
+
+# --- System Endpoints ---
 
 @app.get("/health")
 async def health():
-    """Health check."""
-    # Quick check: can we reach Qdrant and Ollama?
     qdrant_ok = False
-    ollama_ok = False
     try:
-        req = urllib.request.Request(f"{QDRANT_URL}/collections/{COLLECTION}")
-        resp = urllib.request.urlopen(req, timeout=3)
-        info = json.loads(resp.read())
-        qdrant_ok = info.get("result", {}).get("status") == "green"
-        points_count = info.get("result", {}).get("points_count", 0)
-    except Exception:
-        points_count = -1
-
-    try:
-        req = urllib.request.Request(f"{OLLAMA_URL}/api/tags")
-        resp = urllib.request.urlopen(req, timeout=3)
-        models = json.loads(resp.read())
-        ollama_ok = any(m["name"] == EMBED_MODEL for m in models.get("models", []))
+        from core.indexer import _qdrant_request
+        r = _qdrant_request("/collections", method="GET")
+        qdrant_ok = True
     except Exception:
         pass
 
-    return {
-        "status": "ok" if (qdrant_ok and ollama_ok) else "degraded",
-        "version": "1.0.0",
-        "agent": "erudito",
-        "qdrant": "ok" if qdrant_ok else "unreachable",
-        "ollama": "ok" if ollama_ok else "unreachable",
-        "collection": COLLECTION,
-        "points_count": points_count,
-        "embed_model": EMBED_MODEL,
-    }
-
-
-@app.post("/scan")
-async def trigger_scan():
-    """Trigger a full scan of all local sources."""
-    stats = await run_scan()
-    return {"status": "completed", "stats": stats}
-
-
-@app.post("/scan/{node}")
-async def trigger_scan_node(node: str):
-    """Trigger a scan for a specific node."""
-    sources = [s for s in SCAN_SOURCES if s.get("node") == node]
-    if not sources:
-        raise HTTPException(404, f"No sources for node: {node}")
-    stats = await run_scan(sources)
-    return {"status": "completed", "node": node, "stats": stats}
-
-
-@app.get("/status")
-async def status():
-    """Get scan status and last scan times."""
-    state = load_scan_state()
-    sources_info = []
-    for s in SCAN_SOURCES:
-        p = s["path"]
-        info = state.get(p, {})
-        sources_info.append({
-            "path": p,
-            "node": s.get("node"),
-            "type": s.get("type"),
-            "last_commit": info.get("last_commit", "never"),
-            "last_scan": info.get("last_scan", "never"),
-            "exists": os.path.isdir(p),
-        })
-    return {
-        "scan_sources": len(SCAN_SOURCES),
-        "sources": sources_info,
-        "collection": COLLECTION,
-    }
-
-
-@app.get("/audit")
-async def audit(since: str | None = None, limit: int = 50):
-    """Get recent audit log entries."""
-    entries = []
-    try:
-        with open(AUDIT_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if since and entry.get("timestamp", "") < since:
-                    continue
-                entries.append(entry)
-    except FileNotFoundError:
-        pass
-    return {"entries": entries[-limit:], "total": len(entries)}
-
-
-@app.delete("/staleness/cleanup")
-async def cleanup_stale(days: int = 30):
-    """Delete chunks not verified in N days."""
-    # Scroll all points, check last_verified, delete stale ones
-    cutoff = datetime.now(timezone.utc)
-    from datetime import timedelta
-    cutoff = cutoff - timedelta(days=days)
-    cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-
-    deleted = 0
-    offset = None
-    while True:
-        scroll_payload = {
-            "limit": 100,
-            "with_payload": ["last_verified"],
-        }
-        if offset is not None:
-            scroll_payload["offset"] = offset
-
+    redis_ok = False
+    if registry and registry._get_redis():
         try:
-            result = _qdrant_request(
-                f"/collections/{COLLECTION}/points/scroll",
-                data=scroll_payload,
-                method="POST",
-            )
+            registry._get_redis().ping()
+            redis_ok = True
         except Exception:
-            break
+            pass
 
-        points = result.get("result", {}).get("points", [])
-        next_offset = result.get("result", {}).get("next_page_offset")
+    nlm_circuit = nlm.circuit_status()
 
-        stale_ids = []
-        for p in points:
-            lv = p.get("payload", {}).get("last_verified", "")
-            if lv and lv < cutoff_str:
-                stale_ids.append(p["id"])
+    return {
+        "status": "ok" if qdrant_ok else "degraded",
+        "version": "3.0.0",
+        "qdrant": "up" if qdrant_ok else "down",
+        "redis": "up" if redis_ok else "down",
+        "projects": len(registry.list_all()) if registry else 0,
+        "nlm_circuit": "open (rate limited)" if nlm_circuit["tripped"] else "closed (ok)",
+    }
 
-        if stale_ids:
+
+@app.post("/nlm/reset")
+async def reset_nlm_circuit():
+    """Manually reset the NLM circuit breaker after rate limit recovery."""
+    nlm.reset_circuit()
+    return {"status": "ok", "nlm_circuit": "closed"}
+
+
+@app.get("/nlm/status")
+async def nlm_status():
+    """Get NLM circuit breaker status."""
+    status = nlm.circuit_status()
+    return {
+        "tripped": status["tripped"],
+        "tripped_at": str(status["tripped_at"]) if status["tripped_at"] else None,
+        "reason": status["reason"],
+        "cooldown_hours": nlm.NLM_COOLDOWN_HOURS,
+    }
+
+
+@app.post("/feedback")
+async def feedback_endpoint(req: FeedbackRequest):
+    """Record consumer feedback for a query result."""
+    entry = {
+        "timestamp": _now_iso(),
+        "project": req.project,
+        "query": req.query,
+        "useful": req.useful,
+        "coherent": req.coherent,
+        "logical": req.logical,
+    }
+    with open(FEEDBACK_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return {"status": "recorded"}
+
+
+@app.get("/metrics")
+async def metrics():
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    summary = registry.summary()
+
+    # Freshness calculation
+    import statistics
+    freshness_values = []
+    for name in registry.list_all():
+        entry = registry.get(name)
+        if entry and entry.get("last_sync"):
             try:
-                _qdrant_request(
-                    f"/collections/{COLLECTION}/points/delete",
-                    data={"points": stale_ids},
-                    method="POST",
-                )
-                deleted += len(stale_ids)
+                sync_time = datetime.fromisoformat(entry["last_sync"])
+                age_min = (datetime.now(timezone.utc) - sync_time).total_seconds() / 60
+                freshness_values.append(age_min)
             except Exception:
                 pass
 
-        if next_offset is None or not points:
-            break
-        offset = next_offset
+    # Metadata compliance (tracked at file level during scans)
+    total_docs = _total_scanned_files
+    auto_enriched_count = _auto_enriched_files
 
-    audit_log({"action": "staleness_cleanup", "days": days, "deleted": deleted})
-    return {"status": "completed", "deleted": deleted, "cutoff": cutoff_str}
+    nlm_health = round(
+        _nlm_call_stats["success"] / _nlm_call_stats["total"] * 100, 1
+    ) if _nlm_call_stats["total"] > 0 else 100.0
 
+    query_hit = round(
+        _query_stats["high"] / _query_stats["total"] * 100, 1
+    ) if _query_stats["total"] > 0 else 0.0
 
-# ---------------------------------------------------------------------------
-# Product Catalog routes
-# ---------------------------------------------------------------------------
+    feedback_entries = _load_feedback()
+    feedback_stats = _compute_feedback_stats(feedback_entries)
 
-from catalog import (
-    list_projects, get_project, upsert_project,
-    delete_project, search_projects, count_projects,
-)
+    tier_distribution = {1: 0, 2: 0, 3: 0}
+    for name in registry.list_all():
+        entry = registry.get(name)
+        if entry:
+            tier = entry.get("tier") or entry.get("computed_tier", 3)
+            tier_distribution[tier] = tier_distribution.get(tier, 0) + 1
 
-
-@app.get("/catalog")
-async def catalog_list():
-    """List all projects in the catalog."""
-    projects = list_projects()
-    return {"projects": projects, "count": len(projects)}
-
-
-@app.get("/catalog/search")
-async def catalog_search(q: str, top_k: int = 5):
-    """Search projects by natural language query."""
-    results = search_projects(q, top_k)
-    return {"query": q, "results": results}
-
-
-@app.get("/catalog/{name}")
-async def catalog_get(name: str):
-    """Get a project by name."""
-    project = get_project(name)
-    if not project:
-        raise HTTPException(404, f"Project not found: {name}")
-    return project
-
-
-@app.post("/catalog")
-async def catalog_upsert(entry: dict):
-    """Add or update a project in the catalog."""
-    if "name" not in entry:
-        raise HTTPException(400, "Missing 'name' field")
-    point_id = upsert_project(entry)
-    return {"status": "ok", "name": entry["name"], "point_id": point_id}
+    return {
+        "coverage": summary,
+        "freshness_avg_minutes": round(statistics.mean(freshness_values), 1) if freshness_values else 0,
+        "metadata_compliance_pct": round(
+            (1 - auto_enriched_count / total_docs) * 100, 1
+        ) if total_docs > 0 else 100.0,
+        "nlm_health_24h_pct": nlm_health,
+        "query_hit_rate_pct": query_hit,
+        "coherence_last_score": _coherence_cache.get("score"),
+        "coherence_last_run": _coherence_cache.get("timestamp"),
+        "last_scan": _last_scan_time,
+        "feedback": feedback_stats,
+        "tiers": {
+            "distribution": tier_distribution,
+            "nlm_baseline_count": sum(1 for n in registry.list_all() if (registry.get(n) or {}).get("nlm_baseline")),
+        },
+    }
 
 
-@app.delete("/catalog/{name}")
-async def catalog_delete(name: str):
-    """Delete a project from the catalog."""
-    delete_project(name)
-    return {"status": "deleted", "name": name}
+@app.post("/metrics/coherence")
+async def update_coherence(data: dict):
+    """Endpoint for eval-agent to report coherence score."""
+    _coherence_cache["score"] = data.get("score")
+    _coherence_cache["timestamp"] = data.get("timestamp", _now_iso())
+    return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+@app.get("/audit")
+async def audit(limit: int = Query(default=50, ge=1, le=500)):
+    try:
+        with open(AUDIT_FILE, "r") as f:
+            lines = f.readlines()
+        entries = [json.loads(line) for line in lines[-limit:]]
+        entries.reverse()
+        return {"entries": entries}
+    except FileNotFoundError:
+        return {"entries": []}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8095)
+
+# --- Registry Endpoints ---
+
+@app.get("/registry")
+async def list_registry():
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    projects = {}
+    for name in registry.list_all():
+        projects[name] = registry.get(name)
+    return {"projects": projects}
+
+
+@app.get("/registry/{project}")
+async def get_registry_project(project: str):
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    entry = registry.get(project)
+    if not entry:
+        raise HTTPException(404, f"Project '{project}' not found")
+    return entry
+
+
+@app.post("/registry")
+async def register_project(data: dict):
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    name = data.get("name")
+    path = data.get("path")
+    node = data.get("node", "hanzo")
+    repo = data.get("repo", "")
+    project_type = data.get("type", "repo")
+    # Atomic KB extensions (Phase 1, 2026-04-09)
+    atomic = bool(data.get("atomic", False))
+    exclude_patterns = data.get("exclude_patterns") or []
+    content_hash = bool(data.get("content_hash", False))
+    scan_interval_seconds = data.get("scan_interval_seconds")
+
+    if not name or not path:
+        raise HTTPException(400, "name and path are required")
+
+    if project_type not in ("repo", "knowledge_base"):
+        raise HTTPException(400, "type must be 'repo' or 'knowledge_base'")
+
+    if atomic and project_type != "knowledge_base":
+        raise HTTPException(400, "atomic=true requires type='knowledge_base'")
+
+    if not isinstance(exclude_patterns, list) or not all(isinstance(p, str) for p in exclude_patterns):
+        raise HTTPException(400, "exclude_patterns must be a list of strings")
+
+    if scan_interval_seconds is not None:
+        try:
+            scan_interval_seconds = int(scan_interval_seconds)
+            if scan_interval_seconds < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(400, "scan_interval_seconds must be a positive integer")
+
+    expanded = os.path.expanduser(path)
+    if not os.path.isdir(expanded):
+        raise HTTPException(400, f"Path does not exist: {path}")
+
+    if project_type == "repo":
+        from core.scanner import find_git_root
+        if not find_git_root(expanded):
+            raise HTTPException(400, f"Path is not a git repository: {path}")
+
+    try:
+        registry.register(
+            name, path, node, repo,
+            type=project_type,
+            atomic=atomic,
+            exclude_patterns=exclude_patterns,
+            content_hash=content_hash,
+            scan_interval_seconds=scan_interval_seconds,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return {
+        "status": "registered",
+        "project": name,
+        "type": project_type,
+        "atomic": atomic,
+    }
+
+
+# --- Ingest Endpoint (for remote nodes) ---
+
+
+MAX_INGEST_FILE_SIZE = 1 * 1024 * 1024  # 1MB per file
+MAX_INGEST_BATCH_SIZE = 200  # max files per request
+
+
+def _validate_ingest_path(filepath: str) -> str | None:
+    """Validate and normalize an ingest file path. Returns None if invalid."""
+    if not filepath or not isinstance(filepath, str):
+        return None
+    # Reject absolute paths and path traversal
+    if filepath.startswith("/") or ".." in filepath.split("/"):
+        return None
+    # Normalize and reject if it escapes
+    normalized = os.path.normpath(filepath)
+    if normalized.startswith("..") or normalized.startswith("/"):
+        return None
+    return normalized
+
+
+def _parse_ingest_files(data: dict) -> list[tuple[str, str]]:
+    """Parse files from ingest request. Supports dict and list formats.
+
+    Dict format: {"files": {"path/to/file.md": "content", ...}}
+    List format: {"files": [{"path": "file.md", "content": "..."}, ...]}
+
+    Returns list of (filepath, content) tuples.
+    """
+    files = data.get("files", {})
+    if isinstance(files, dict):
+        return [(k, v) for k, v in files.items() if isinstance(v, str)]
+    elif isinstance(files, list):
+        result = []
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            path = f.get("path") or f.get("filename") or f.get("name")
+            content = f.get("content", "")
+            if path and content:
+                result.append((path, content))
+        return result
+    return []
+
+
+@app.post("/ingest/{project}")
+async def ingest_endpoint(project: str, data: dict):
+    """Ingest documentation files from remote nodes.
+
+    Accepts dict format: {"files": {"docs/spec/SPEC.md": "content", ...}, "node": "sariatu"}
+    Also accepts list format: {"files": [{"path": "file.md", "content": "..."}], "node": "sariatu"}
+    Stores files in data/ingested/{project}/ preserving directory structure.
+    """
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+
+    parsed_files = _parse_ingest_files(data)
+    if not parsed_files:
+        raise HTTPException(400, "No files provided. Use dict {path: content} or list [{path, content}] format.")
+
+    if len(parsed_files) > MAX_INGEST_BATCH_SIZE:
+        raise HTTPException(413, f"Too many files ({len(parsed_files)}). Max {MAX_INGEST_BATCH_SIZE} per request.")
+
+    node = data.get("node", "unknown")
+    auto_curate = data.get("auto_curate", False)
+
+    ingest_dir = Path(INGESTED_DIR) / project
+    ingest_dir.mkdir(parents=True, exist_ok=True)
+
+    stored = 0
+    rejected = []
+    for filepath, content in parsed_files:
+        safe_path = _validate_ingest_path(filepath)
+        if not safe_path:
+            rejected.append(filepath)
+            continue
+        if len(content.encode("utf-8")) > MAX_INGEST_FILE_SIZE:
+            rejected.append(filepath)
+            continue
+        if not content.strip():
+            continue
+
+        target = ingest_dir / safe_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        stored += 1
+
+    audit_log({
+        "action": "ingest",
+        "project": project,
+        "node": node,
+        "files": stored,
+        "rejected": len(rejected),
+    })
+    logger.info(f"Ingested {stored} files for {project} from {node} ({len(rejected)} rejected)")
+
+    # Register or update project
+    entry = registry.get(project)
+    if not entry:
+        registry._data["projects"][project] = {
+            **dict(__import__('core.registry', fromlist=['_DEFAULT_ENTRY'])._DEFAULT_ENTRY),
+            "path": str(ingest_dir),
+            "node": node,
+            "status": "pending",
+        }
+        registry._persist()
+        logger.info(f"Auto-registered project '{project}' from node {node}")
+    else:
+        proj = registry._data["projects"].get(project)
+        if proj:
+            proj["node"] = node
+            proj["status"] = "pending"
+            proj["doc_count"] = sum(1 for _ in ingest_dir.rglob("*.md"))
+            registry._persist()
+
+    # Curate the ingested files directly (they're already .md, no need for scanner)
+    if auto_curate and stored > 0:
+        delta_files = []
+        for md_file in sorted(ingest_dir.rglob("*.md")):
+            delta_files.append({
+                "path": str(md_file.relative_to(ingest_dir)),
+                "content": md_file.read_text(encoding="utf-8"),
+                "action": "added",
+            })
+
+        curation_result = curate_project(project, str(ingest_dir), delta_files, CURATED_DIR)
+        if curation_result.success:
+            proj = registry._data["projects"].get(project)
+            if proj:
+                proj["curation_status"] = "curated"
+                proj["curated_at"] = _now_iso()
+                proj["curated_files"] = curation_result.curated_files
+                proj["doc_count"] = stored
+                registry._persist()
+
+        return {
+            "status": "ingested_and_curated",
+            "project": project,
+            "node": node,
+            "files_stored": stored,
+            "curated_files": curation_result.curated_files,
+            "features": curation_result.features,
+        }
+
+    resp = {
+        "status": "ingested",
+        "project": project,
+        "node": node,
+        "files_stored": stored,
+    }
+    if rejected:
+        resp["rejected"] = rejected
+    return resp
+
+
+@app.delete("/ingest/{project}")
+async def delete_ingest_endpoint(project: str, prefix: str | None = Query(default=None)):
+    """Delete ingested files for a project.
+
+    If prefix is given, only files under that prefix are removed.
+    If no prefix, all ingested files for the project are removed.
+    """
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+
+    ingest_dir = Path(INGESTED_DIR) / project
+    if not ingest_dir.exists():
+        return {"status": "deleted", "project": project, "files_removed": 0}
+
+    removed = 0
+    if prefix:
+        safe_prefix = _validate_ingest_path(prefix)
+        if not safe_prefix:
+            raise HTTPException(400, f"Invalid prefix: {prefix}")
+        target_dir = ingest_dir / safe_prefix
+        if target_dir.is_dir():
+            for f in list(target_dir.rglob("*")):
+                if f.is_file():
+                    f.unlink()
+                    removed += 1
+            # Clean up empty directories
+            for d in sorted(target_dir.rglob("*"), reverse=True):
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            if target_dir.exists() and not any(target_dir.iterdir()):
+                target_dir.rmdir()
+        elif target_dir.is_file():
+            target_dir.unlink()
+            removed = 1
+    else:
+        for f in list(ingest_dir.rglob("*")):
+            if f.is_file():
+                f.unlink()
+                removed += 1
+        # Clean up empty directories
+        for d in sorted(ingest_dir.rglob("*"), reverse=True):
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+
+    audit_log({"action": "delete_ingest", "project": project, "prefix": prefix, "files_removed": removed})
+    logger.info(f"Deleted {removed} ingested files for {project} (prefix={prefix})")
+
+    return {"status": "deleted", "project": project, "files_removed": removed}
+
+
+# --- Classify Endpoint ---
+
+@app.post("/classify")
+async def classify_endpoint(dry_run: bool = Query(default=True)):
+    """Classify inbox files and move them to their project directories.
+
+    Reads from claude_contracts, classifies by keyword, moves to {project}/docs/contracts/.
+    Default: dry_run=True (preview only). Set dry_run=false to actually move files.
+    """
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+
+    from core.classifier import classify_inbox, move_classified
+
+    inbox_path = "/home/r0calex/desarrollos_openclaw/claude_contracts"
+
+    classification = classify_inbox(inbox_path)
+
+    # Build project_paths from registry
+    project_paths = {}
+    for name in registry.list_all():
+        entry = registry.get(name)
+        if entry and entry.get("path"):
+            project_paths[name] = entry["path"]
+
+    # Move (or preview)
+    result = move_classified(inbox_path, classification, project_paths, dry_run=dry_run)
+
+    audit_log({
+        "action": "classify_dry_run" if dry_run else "classify_move",
+        "classified": {k: len(v) for k, v in result.classified.items()},
+        "unclassified": len(result.unclassified),
+        "moved": result.moved,
+    })
+
+    return {
+        "dry_run": dry_run,
+        "classified": {k: v for k, v in result.classified.items()},
+        "unclassified": result.unclassified,
+        "moved": result.moved,
+        "errors": result.errors,
+        "summary": {
+            "total_files": sum(len(v) for v in result.classified.values()) + len(result.unclassified),
+            "classified": sum(len(v) for v in result.classified.values()),
+            "unclassified": len(result.unclassified),
+        },
+    }
+
+
+# --- Scan Endpoints ---
+
+@app.post("/scan")
+async def scan_all():
+    asyncio.create_task(_run_scan_all())
+    return {"status": "scan_started", "projects": registry.list_all() if registry else []}
+
+
+@app.post("/scan/{project}")
+async def scan_project(project: str):
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    if not registry.get(project):
+        raise HTTPException(404, f"Project '{project}' not found")
+    asyncio.create_task(_scan_project(project))
+    return {"status": "scan_started", "project": project}
+
+
+# --- Curate Endpoint ---
+
+@app.post("/curate/{project}")
+async def curate_endpoint(project: str, force_nlm: bool = Query(False)):
+    """Full curation pipeline: scan → curate → tier-based distillation → Qdrant index.
+
+    Runs synchronously. Returns detailed results of each step.
+    Use force_nlm=true to bypass tier routing and always run NLM.
+    """
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+    entry = registry.get(project)
+    if not entry:
+        raise HTTPException(404, f"Project '{project}' not found")
+
+    result = {
+        "project": project,
+        "steps": {},
+    }
+
+    repo_path = os.path.expanduser(entry["path"])
+    if not os.path.isdir(repo_path):
+        raise HTTPException(400, f"Path not found: {repo_path}")
+
+    # Step 1: Scan for delta (git or filesystem)
+    is_ingested = INGESTED_DIR in repo_path
+    if is_ingested:
+        delta = compute_fs_delta(project, repo_path, entry.get("last_hash"))
+    else:
+        delta = compute_delta(project, repo_path, entry.get("last_hash"))
+    if delta:
+        # Sanitize
+        for file_info in delta["files"]:
+            if file_info["content"]:
+                san = await sanitize_text(file_info["content"])
+                file_info["content"] = san["sanitized"]
+
+        result["steps"]["scan"] = {"files": len(delta["files"]), "status": "delta_detected"}
+    else:
+        result["steps"]["scan"] = {"files": 0, "status": "no_changes"}
+
+    # Step 2: Curate (always run even without delta — uses existing files)
+    if delta:
+        curation_result = curate_project(project, repo_path, delta["files"], CURATED_DIR)
+        proj = registry._data["projects"].get(project)
+        if proj and curation_result.success:
+            proj["curation_status"] = "curated"
+            proj["curated_at"] = _now_iso()
+            proj["curated_files"] = curation_result.curated_files
+            registry._persist()
+            if delta:
+                registry.update_sync(project, delta["new_hash"],
+                                     doc_count=len([f for f in delta["files"] if f["action"] != "deleted"]))
+        result["steps"]["curate"] = {
+            "status": "ok" if curation_result.success else "error",
+            "curated_files": curation_result.curated_files,
+            "features": curation_result.features,
+            "errors": curation_result.errors,
+        }
+        audit_log({"action": "curation_complete", "project": project,
+                   "features": curation_result.features, "curated_files": curation_result.curated_files})
+    else:
+        # Check if curated files already exist
+        curated_dir = Path(CURATED_DIR) / project
+        existing = list(curated_dir.glob("*.md")) if curated_dir.is_dir() else []
+        result["steps"]["curate"] = {
+            "status": "skipped_no_delta",
+            "existing_curated_files": len(existing),
+        }
+
+    # Step 3: Compute and store tier
+    computed = compute_tier(project, os.path.join(CURATED_DIR, project), entry)
+    registry.update_fields(project, computed_tier=computed)
+    # Re-fetch entry to get updated tier
+    entry = registry.get(project) or entry
+    tier = entry.get("tier") or computed
+
+    # Step 4: Distill based on tier (or force_nlm)
+    curated_dir = os.path.join(CURATED_DIR, project)
+    curated_path = Path(curated_dir)
+    if not curated_path.is_dir() or not list(curated_path.glob("*.md")):
+        result["steps"]["distill"] = {"status": "skipped_no_curated_files"}
+        result["tier"] = tier
+        result["distill_backend"] = "skipped"
+        return result
+
+    if force_nlm and not NLM_ENABLED:
+        return JSONResponse(status_code=503, content={"error": "NLM is disabled (NLM_ENABLED=false)"})
+
+    distill_backend = "unknown"
+    try:
+        await _distill_project(project, force_nlm=force_nlm)
+        distill_backend = "nlm" if force_nlm else ("nlm" if (tier == 1 and not entry.get("nlm_baseline")) else ("llm" if tier <= 2 else "direct"))
+    except ValueError as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+    except Exception as e:
+        logger.error(f"Distillation failed for {project}: {e}")
+        distill_backend = "failed"
+
+    result["steps"]["distill"] = {"status": "ok" if distill_backend != "failed" else "error", "backend": distill_backend}
+    result["tier"] = tier
+    result["distill_backend"] = distill_backend
+    result["status"] = "validated" if distill_backend != "failed" else "partial"
+    return result
+
+
+# --- Search Endpoint ---
+
+@app.get("/search")
+async def search_endpoint(
+    q: str = Query(..., min_length=1),
+    project: str | None = Query(default=None),
+    top_k: int = Query(default=5, ge=1, le=50),
+    mode: str = Query(default="default", pattern="^(default|dual|agent|agentic)$"),
+    max_tokens: int = Query(default=800, ge=100, le=4000),
+):
+    _query_stats["total"] += 1
+    result = await execute_query(
+        query=q,
+        project=project,
+        top_k=top_k,
+        nlm_client=nlm,
+        registry=registry,
+        mode=mode,
+        max_tokens=max_tokens,
+    )
+    if result.get("confidence") == "high":
+        _query_stats["high"] += 1
+    return result

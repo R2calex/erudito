@@ -1,4 +1,9 @@
-data/
+.env
 __pycache__/
 *.pyc
-.env
+data/audit.jsonl
+data/registry.yaml
+data/scan_state.json
+data/curated/
+data/ingested/
+.claude/

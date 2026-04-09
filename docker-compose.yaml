@@ -1,0 +1,66 @@
+services:
+  erudito:
+    build: .
+    image: erudito:v3-atomic
+    container_name: erudito-v3
+    ports:
+      - "100.119.223.20:8095:8095"
+      - "127.0.0.1:8095:8095"
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://172.17.0.1:11434
+      - LITELLM_URL=http://litellm-proxy-local:4000/v1
+      - REDIS_URL=${REDIS_URL}
+      - SANITIZER_URL=http://sanitizer-hanzo:8086
+      - ERUDITO_CONFIDENCE_THRESHOLD=0.75
+      - SCAN_INTERVAL_MINUTES=15
+      - DATA_DIR=/app/data
+      # Distill LLM (2026-04-09): switched from zen/minimax-m2.5 to go/minimax-m2.7
+      # because opencode.ai zen credit pool drained. m2.7 is a "thinking" reasoning
+      # model — needs more tokens for internal reasoning before producing content
+      # and a longer timeout than the non-thinking zen/m2.5. The openai/ prefix
+      # tells the litellm Python SDK to use OpenAI-compatible wire format when
+      # routing through the LiteLLM proxy (the SDK strips the prefix before sending).
+      - DISTILL_LLM_MODEL=openai/go/minimax-m2.7
+      - DISTILL_LLM_MAX_TOKENS=8000
+      - DISTILL_LLM_TIMEOUT=180
+      - NLM_ENABLED=true
+      - NLM_MCP_URL=http://notebooklm-mcp:8765/mcp
+      - MAX_CONCURRENT_NLM=2
+      - LOCAL_NODE=hanzo
+      - DEVOPS_AGENT_KUBO=http://100.66.123.113:8091
+      - DEVOPS_AGENT_SARIATU=http://100.76.110.104:8090
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+    volumes:
+      - ./data:/app/data
+      - /home/r0calex/ai-lab:/home/r0calex/ai-lab:ro
+      - /home/r0calex/desarrollos_openclaw:/home/r0calex/desarrollos_openclaw:ro
+      # Preserve legacy /app/knowledge mount (docker-patterns + Phase 0 snapshot)
+      - /home/r0calex/ai-lab/knowledge:/app/knowledge:ro
+      # Phase 1 (2026-04-09): live mount of Claude Code auto-memory for atomic-KB indexing.
+      # Read-only — Erudito only reads, AutoDream owns writes from the host side.
+      - /home/r0calex/.claude/projects/-home-r0calex-ai-lab/memory:/app/memories/ai-lab:ro
+    networks:
+      - litellm-local_litellm-network
+    restart: unless-stopped
+    depends_on:
+      - sanitizer-hanzo
+
+  sanitizer-hanzo:
+    image: kubo-sanitizer:local
+    container_name: sanitizer-hanzo
+    ports:
+      - "100.119.223.20:8086:8086"
+      - "127.0.0.1:8086:8086"
+    networks:
+      - litellm-local_litellm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8086/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  litellm-local_litellm-network:
+    external: true

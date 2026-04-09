@@ -1,0 +1,103 @@
+<h2>Erudito v3 — Propuestas de Arquitectura</h2>
+<p class="subtitle">3 enfoques con diferentes trade-offs. Todos cumplen los mismos requisitos funcionales.</p>
+
+<div class="section">
+  <h3>Resumen de requisitos acordados</h3>
+  <div style="font-size: 13px; background: #44475a; padding: 16px; border-radius: 8px; line-height: 1.8;">
+    <div><span style="color: #50fa7b;">&#10003;</span> Mapa triple: proyecto + notebook_id + repo (1:1)</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> Event-driven por deltas (hash comparison)</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> Auto-enrich metadata faltante + hook de enforcement</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> Sanitizer local en Hanzo (fork de kubo-sanitizer)</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> Query: Qdrant primero, NotebookLM si score &lt; umbral</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> "No se" honesto cuando no hay info</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> Sin alertas al mesh por ahora (solo log interno)</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> KPIs: coherencia (vs NotebookLM) + cobertura (proyectos validados)</div>
+    <div><span style="color: #50fa7b;">&#10003;</span> mesh-overview notebook en backlog (fase 2)</div>
+  </div>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Monolito Refactoreado</h3>
+      <p style="color: #f8f8f2; margin-bottom: 12px;">Un solo main.py como hoy, pero reescrito con la nueva logica. Erudito v2 evoluciona a v3.</p>
+      <div style="font-size: 12px; line-height: 1.7;">
+        <div style="color: #8be9fd; margin-bottom: 4px;">Estructura:</div>
+        <div style="font-family: monospace; padding-left: 8px;">
+          erudito/<br>
+          &nbsp;&nbsp;main.py &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># FastAPI + todo el core</span><br>
+          &nbsp;&nbsp;notebooklm.py &nbsp;&nbsp;<span style="color: #6272a4;"># Cliente NotebookLM MCP</span><br>
+          &nbsp;&nbsp;sanitizer.py &nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># Cliente sanitizer</span><br>
+          &nbsp;&nbsp;registry.py &nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># Mapa proyecto-notebook-repo</span><br>
+          &nbsp;&nbsp;data/ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># Estado local</span>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top: 12px;">
+        <div class="pros"><h4>Pros</h4><ul><li>Menor cambio vs v2</li><li>Facil de debuggear (un proceso)</li><li>Deploy simple</li></ul></div>
+        <div class="cons"><h4>Cons</h4><ul><li>main.py crece mucho</li><li>Dificil de testear en aislamiento</li><li>Mezcla responsabilidades</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Modular por Dominio</h3>
+      <p style="color: #f8f8f2; margin-bottom: 12px;">Erudito se divide en modulos con responsabilidades claras. Un proceso, multiples archivos bien separados.</p>
+      <div style="font-size: 12px; line-height: 1.7;">
+        <div style="color: #8be9fd; margin-bottom: 4px;">Estructura:</div>
+        <div style="font-family: monospace; padding-left: 8px;">
+          erudito/<br>
+          &nbsp;&nbsp;main.py &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># FastAPI app + endpoints</span><br>
+          &nbsp;&nbsp;core/<br>
+          &nbsp;&nbsp;&nbsp;&nbsp;registry.py &nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># Mapa triple (proyecto+nb+repo)</span><br>
+          &nbsp;&nbsp;&nbsp;&nbsp;scanner.py &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># Delta detection (git hashes)</span><br>
+          &nbsp;&nbsp;&nbsp;&nbsp;indexer.py &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># Qdrant embedding pipeline</span><br>
+          &nbsp;&nbsp;&nbsp;&nbsp;query.py &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># Search + confidence routing</span><br>
+          &nbsp;&nbsp;integrations/<br>
+          &nbsp;&nbsp;&nbsp;&nbsp;notebooklm.py &nbsp;&nbsp;<span style="color: #6272a4;"># Cliente NotebookLM MCP</span><br>
+          &nbsp;&nbsp;&nbsp;&nbsp;sanitizer.py &nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># Cliente sanitizer Hanzo</span><br>
+          &nbsp;&nbsp;&nbsp;&nbsp;github.py &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># Repo sync (opcional)</span><br>
+          &nbsp;&nbsp;data/ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># registry.yaml, audit.jsonl</span><br>
+          &nbsp;&nbsp;kpis/ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># KPI definitions para eval-agent</span>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top: 12px;">
+        <div class="pros"><h4>Pros</h4><ul><li>Cada modulo testeable por separado</li><li>Facil agregar integraciones (github, mesh-overview)</li><li>Responsabilidades claras</li><li>Un solo proceso, un solo deploy</li></ul></div>
+        <div class="cons"><h4>Cons</h4><ul><li>Mas archivos que manejar</li><li>Rewrite mas grande que A</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Microservicios Separados</h3>
+      <p style="color: #f8f8f2; margin-bottom: 12px;">Cada responsabilidad es un servicio independiente con su propio container. Se comunican via HTTP/Redis.</p>
+      <div style="font-size: 12px; line-height: 1.7;">
+        <div style="color: #8be9fd; margin-bottom: 4px;">Servicios:</div>
+        <div style="font-family: monospace; padding-left: 8px;">
+          erudito-api &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># FastAPI gateway (:8095)</span><br>
+          erudito-scanner &nbsp;&nbsp;<span style="color: #6272a4;"># Delta watcher + sync</span><br>
+          erudito-indexer &nbsp;&nbsp;<span style="color: #6272a4;"># Qdrant pipeline</span><br>
+          erudito-nlm &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: #6272a4;"># NotebookLM orchestrator</span><br>
+          sanitizer-hanzo &nbsp;&nbsp;<span style="color: #6272a4;"># Masking service</span>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top: 12px;">
+        <div class="pros"><h4>Pros</h4><ul><li>Maximo aislamiento</li><li>Escala independiente</li><li>Si NotebookLM se cae, nada mas se afecta</li></ul></div>
+        <div class="cons"><h4>Cons</h4><ul><li>5 containers = mas complejidad ops</li><li>Overhead de red entre servicios</li><li>Mas dificil de debuggear</li><li>Overkill para el volumen actual</li></ul></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px; padding: 16px; background: #44475a; border-radius: 8px;">
+  <h3 style="color: #50fa7b;">Recomendacion: B (Modular por Dominio)</h3>
+  <p style="line-height: 1.7;">
+    <strong>A</strong> repite el problema de v2 — main.py monolitico que crece sin control.<br>
+    <strong>C</strong> es overkill — no tenemos el volumen para justificar 5 containers, y agrega complejidad ops innecesaria.<br>
+    <strong>B</strong> es el sweet spot: un solo proceso facil de operar, pero con modulos claros que se pueden testear, extender y entender por separado. Agregar mesh-overview despues es un archivo nuevo en integrations/, no un rediseno.
+  </p>
+</div>

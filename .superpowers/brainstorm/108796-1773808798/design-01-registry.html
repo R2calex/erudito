@@ -1,0 +1,94 @@
+<h2>Seccion 1/6 — El Registry (Mapa Central)</h2>
+<p class="subtitle">El corazon de Erudito v3. Todo gira alrededor de este registro.</p>
+
+<div class="section">
+  <h3>Que es</h3>
+  <p>Un archivo YAML (<code>data/registry.yaml</code>) que mapea cada proyecto del AI-Lab a su notebook de NotebookLM y su repo de GitHub. Es la unica fuente de verdad para saber: que proyectos existen, donde viven, y en que estado estan.</p>
+</div>
+
+<div class="section">
+  <h3>Estructura de una entrada</h3>
+  <div class="mockup">
+    <div class="mockup-header">data/registry.yaml</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 12px; line-height: 1.8;">
+<span style="color: #8be9fd;">projects:</span>
+  <span style="color: #f1fa8c;">infra-mcp:</span>
+    <span style="color: #bd93f9;">path:</span> ~/ai-lab/infra-mcp
+    <span style="color: #bd93f9;">node:</span> hanzo
+    <span style="color: #bd93f9;">repo:</span> r0calex/infra-mcp        <span style="color: #6272a4;"># GitHub</span>
+    <span style="color: #bd93f9;">notebook_id:</span> null              <span style="color: #6272a4;"># Se llena al crear notebook</span>
+    <span style="color: #bd93f9;">last_hash:</span> e2c8bfc...          <span style="color: #6272a4;"># Ultimo commit procesado</span>
+    <span style="color: #bd93f9;">last_sync:</span> 2026-03-17T14:00:00Z
+    <span style="color: #bd93f9;">status:</span> validated              <span style="color: #6272a4;"># pending | synced | validated | stale</span>
+    <span style="color: #bd93f9;">coverage:</span> 0.85                 <span style="color: #6272a4;"># KPI: % de docs indexados y validados</span>
+    <span style="color: #bd93f9;">auto_enriched:</span> false           <span style="color: #6272a4;"># true si metadata fue inferida</span>
+    <span style="color: #bd93f9;">doc_count:</span> 12                  <span style="color: #6272a4;"># .md files tracked</span>
+    <span style="color: #bd93f9;">last_nlm_session:</span> 2026-03-17T10:00:00Z  <span style="color: #6272a4;"># Ultima consulta a NotebookLM</span>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Ciclo de vida de un proyecto en el registry</h3>
+  <div class="mockup">
+    <div class="mockup-header">Estados y transiciones</div>
+    <div class="mockup-body" style="text-align: center; padding: 24px; font-size: 13px;">
+      <div style="display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap;">
+        <div style="background: #6272a4; padding: 8px 16px; border-radius: 20px;">pending</div>
+        <div style="color: #6272a4;">──registro──▶</div>
+        <div style="background: #f1fa8c; color: #282a36; padding: 8px 16px; border-radius: 20px;">synced</div>
+        <div style="color: #6272a4;">──rondin OK──▶</div>
+        <div style="background: #50fa7b; color: #282a36; padding: 8px 16px; border-radius: 20px;">validated</div>
+      </div>
+      <div style="margin-top: 16px; display: flex; align-items: center; justify-content: center; gap: 12px;">
+        <div style="background: #50fa7b; color: #282a36; padding: 8px 16px; border-radius: 20px;">validated</div>
+        <div style="color: #6272a4;">──nuevo commit──▶</div>
+        <div style="background: #ffb86c; color: #282a36; padding: 8px 16px; border-radius: 20px;">stale</div>
+        <div style="color: #6272a4;">──re-sync──▶</div>
+        <div style="background: #50fa7b; color: #282a36; padding: 8px 16px; border-radius: 20px;">validated</div>
+      </div>
+      <div style="margin-top: 20px; font-size: 11px; color: #6272a4; line-height: 1.6;">
+        <strong>pending:</strong> Proyecto registrado, sin notebook ni indexacion<br>
+        <strong>synced:</strong> Archivos en Qdrant + fuentes en NotebookLM, pero sin validar<br>
+        <strong>validated:</strong> Rondin completo: Qdrant + NotebookLM + preguntas respondidas + notas creadas<br>
+        <strong>stale:</strong> Hay commits nuevos que no se han procesado
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Operaciones del Registry</h3>
+  <div style="font-size: 13px; line-height: 1.8;">
+    <div style="background: #44475a; padding: 12px; border-radius: 6px; margin-bottom: 8px;">
+      <code style="color: #50fa7b;">register(name, path, node, repo)</code> → Agrega proyecto con status=pending
+    </div>
+    <div style="background: #44475a; padding: 12px; border-radius: 6px; margin-bottom: 8px;">
+      <code style="color: #50fa7b;">get(name)</code> → Retorna la entrada completa
+    </div>
+    <div style="background: #44475a; padding: 12px; border-radius: 6px; margin-bottom: 8px;">
+      <code style="color: #50fa7b;">update_sync(name, hash, notebook_id)</code> → Actualiza hash, sync time, status=synced
+    </div>
+    <div style="background: #44475a; padding: 12px; border-radius: 6px; margin-bottom: 8px;">
+      <code style="color: #50fa7b;">mark_validated(name, coverage)</code> → status=validated con KPI de cobertura
+    </div>
+    <div style="background: #44475a; padding: 12px; border-radius: 6px; margin-bottom: 8px;">
+      <code style="color: #50fa7b;">mark_stale(name)</code> → Cuando se detecta nuevo commit sin procesar
+    </div>
+    <div style="background: #44475a; padding: 12px; border-radius: 6px; margin-bottom: 8px;">
+      <code style="color: #50fa7b;">list_by_status(status)</code> → Filtrar por estado (util para el rondin)
+    </div>
+    <div style="background: #44475a; padding: 12px; border-radius: 6px;">
+      <code style="color: #50fa7b;">summary()</code> → KPI global: total, por estado, cobertura promedio
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 16px; padding: 16px; background: #44475a; border-radius: 8px;">
+  <h3 style="color: #f1fa8c;">Decisiones de diseno</h3>
+  <ul style="line-height: 1.8; font-size: 13px;">
+    <li><strong>YAML no DB:</strong> Es un archivo plano. Con 10-20 proyectos no necesitamos Postgres para esto. Facil de leer, editar manualmente, y versionar en git.</li>
+    <li><strong>notebook_id nullable:</strong> Un proyecto puede existir sin notebook (si NotebookLM no esta disponible). Erudito sigue funcionando con Qdrant.</li>
+    <li><strong>coverage como campo:</strong> Permite que eval-agent lea el registry directamente para el KPI de cobertura sin llamar a Erudito.</li>
+  </ul>
+</div>
