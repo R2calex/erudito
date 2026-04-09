@@ -1,8 +1,10 @@
-"""Delta detection via git hash comparison.
+"""Delta detection via git hash comparison and filesystem scanning.
 
 Scans project repos for .md file changes since the last known commit.
+Also supports non-git directories (e.g. ingested files from remote nodes).
 Produces Delta objects consumed by Indexer and NotebookLM cycle.
 """
+import hashlib
 import logging
 import os
 import subprocess
@@ -13,22 +15,33 @@ from core.enricher import enrich_content
 
 logger = logging.getLogger("erudito.scanner")
 
-# v3 scans only .md files
+# v3 scans only .md files for repos
 SCAN_EXTENSIONS = {".md"}
+# Knowledge bases scan additional file types
+KB_EXTENSIONS = {".md", ".txt", ".yaml", ".yml"}
 EXCLUDED_FILES = {".env", "credentials.json", "auth-profiles.json", "join_token.txt"}
 EXCLUDED_DIRS = {"node_modules", ".git", "__pycache__", ".pytest_cache", "venv", ".venv", "data", ".superpowers"}
 
 
-def should_scan_file(filepath: str) -> bool:
-    """Check if a file should be scanned based on extension and exclusion rules."""
+def should_scan_file(
+    filepath: str,
+    extensions: set[str] | None = None,
+    exclude_patterns: list[str] | None = None,
+) -> bool:
+    """Check if a file should be scanned based on extension and exclusion rules.
+
+    exclude_patterns: optional list of basenames to skip (e.g. ["MEMORY.md"]).
+    """
     basename = os.path.basename(filepath)
     if basename in EXCLUDED_FILES:
+        return False
+    if exclude_patterns and basename in exclude_patterns:
         return False
     parts = filepath.replace("\\", "/").split("/")
     if any(d in EXCLUDED_DIRS for d in parts):
         return False
     _, ext = os.path.splitext(filepath)
-    return ext in SCAN_EXTENSIONS
+    return ext in (extensions or SCAN_EXTENSIONS)
 
 
 def find_git_root(path: str) -> str | None:
@@ -165,6 +178,109 @@ def compute_delta(
         "project": project_name,
         "old_hash": last_hash,
         "new_hash": head,
+        "files": files,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def compute_fs_hash(
+    dir_path: str,
+    content_hash: bool = False,
+    extensions: set[str] | None = None,
+    exclude_patterns: list[str] | None = None,
+) -> str:
+    """Compute a deterministic hash of directory contents.
+
+    Used for change detection in non-git directories (e.g. ingested files).
+
+    Modes:
+    - content_hash=False (default): hash filename + size + mtime (cheap, fast)
+    - content_hash=True: hash filename + sha256 of file content (catches mtime
+      churn from tools that rewrite files without semantic changes, e.g. AutoDream)
+
+    When extensions/exclude_patterns are provided the hash only considers files
+    that would actually be scanned, so excluded files don't trigger spurious deltas.
+    """
+    entries = []
+    for root, dirs, filenames in os.walk(dir_path):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+        for fname in sorted(filenames):
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, dir_path)
+            # Honor scan filters in the hash so excluded files don't churn it
+            if extensions is not None or exclude_patterns:
+                if not should_scan_file(rel_path, extensions, exclude_patterns):
+                    continue
+            try:
+                if content_hash:
+                    h = hashlib.sha256()
+                    with open(full_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            h.update(chunk)
+                    entries.append(f"{rel_path}:{h.hexdigest()}")
+                else:
+                    stat = os.stat(full_path)
+                    entries.append(f"{rel_path}:{stat.st_size}:{int(stat.st_mtime)}")
+            except OSError:
+                continue
+    return hashlib.sha256("\n".join(sorted(entries)).encode()).hexdigest()[:16]
+
+
+def compute_fs_delta(
+    project_name: str,
+    dir_path: str,
+    last_hash: str | None,
+    extensions: set[str] | None = None,
+    exclude_patterns: list[str] | None = None,
+    content_hash: bool = False,
+) -> dict | None:
+    """Compute delta for a non-git directory (e.g. ingested files, knowledge bases).
+
+    Uses filesystem listing instead of git diff.
+    Returns a Delta dict compatible with compute_delta output, or None if no changes.
+    """
+    if not os.path.isdir(dir_path):
+        logger.warning(f"Directory not found for {project_name}: {dir_path}")
+        return None
+
+    current_hash = compute_fs_hash(
+        dir_path,
+        content_hash=content_hash,
+        extensions=extensions,
+        exclude_patterns=exclude_patterns,
+    )
+    if current_hash == last_hash:
+        return None  # No changes
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    files = []
+    for root, dirs, filenames in os.walk(dir_path):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+        for fname in filenames:
+            rel_path = os.path.relpath(os.path.join(root, fname), dir_path)
+            if not should_scan_file(rel_path, extensions, exclude_patterns):
+                continue
+            full_path = os.path.join(root, fname)
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                enriched_content, was_enriched = enrich_content(content, fname, project_name, today)
+                files.append({
+                    "path": rel_path,
+                    "action": "added",
+                    "content": enriched_content,
+                    "auto_enriched": was_enriched,
+                })
+            except Exception as e:
+                logger.warning(f"Error reading {full_path}: {e}")
+
+    if not files:
+        return None
+
+    return {
+        "project": project_name,
+        "old_hash": last_hash,
+        "new_hash": current_hash,
         "files": files,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

@@ -115,16 +115,60 @@ def delete_by_source(source_file: str, collection: str = COLLECTION_KNOWLEDGE):
     })
 
 
-def search(query_embedding: list[float], collection: str = COLLECTION_KNOWLEDGE,
-           top_k: int = 5, project_filter: str | None = None) -> list[dict]:
-    """Semantic search in Qdrant. Returns list of {score, payload}."""
+def delete_by_project_and_distill_source(
+    project: str,
+    distill_source: str,
+    collection: str = COLLECTION_NLM_NOTES,
+):
+    """Delete all Qdrant points for a (project, distill_source) tuple.
+
+    Used by the atomic-KB pipeline to wipe-and-rebuild on each delta, so deleted
+    or renamed source files don't leave orphan embeddings behind. Scoped to
+    distill_source so we never touch points produced by other backends.
+    """
+    _qdrant_request(f"/collections/{collection}/points/delete", data={
+        "filter": {"must": [
+            {"key": "project", "match": {"value": project}},
+            {"key": "distill_source", "match": {"value": distill_source}},
+        ]}
+    })
+
+
+def search(
+    query_embedding: list[float],
+    collection: str = COLLECTION_KNOWLEDGE,
+    top_k: int = 5,
+    project_filter: str | None = None,
+    expand_linked: bool = True,
+) -> list[dict]:
+    """Semantic search in Qdrant. Returns list of {score, payload}.
+
+    When project_filter is set and expand_linked=True (default), the filter
+    matches points where EITHER `project=X` OR `linked_project=X`. This makes
+    queries scoped to a project automatically pick up atomic-KB memories that
+    reference that project (e.g. a `project_aegis.md` from auto-memory shows
+    up alongside the `aegis` repo's own curated docs).
+
+    Set expand_linked=False to use strict project matching (legacy behavior).
+    """
     body: dict = {
         "vector": query_embedding,
         "limit": top_k,
         "with_payload": True,
     }
     if project_filter:
-        body["filter"] = {"must": [{"key": "project", "match": {"value": project_filter}}]}
+        if expand_linked:
+            # Qdrant `should` = OR semantics. Wrap in must so it's always required.
+            body["filter"] = {
+                "must": [{
+                    "should": [
+                        {"key": "project", "match": {"value": project_filter}},
+                        {"key": "linked_project", "match": {"value": project_filter}},
+                    ]
+                }]
+            }
+        else:
+            body["filter"] = {"must": [{"key": "project", "match": {"value": project_filter}}]}
     result = _qdrant_request(f"/collections/{collection}/points/search", data=body)
     return [{"score": r["score"], "payload": r.get("payload", {})} for r in result.get("result", [])]
 

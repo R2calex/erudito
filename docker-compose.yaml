@@ -1,7 +1,8 @@
 services:
   erudito:
     build: .
-    container_name: erudito
+    image: erudito:v3-atomic
+    container_name: erudito-v3
     ports:
       - "100.119.223.20:8095:8095"
       - "127.0.0.1:8095:8095"
@@ -25,6 +26,11 @@ services:
       - ./data:/app/data
       - /home/r0calex/ai-lab:/home/r0calex/ai-lab:ro
       - /home/r0calex/desarrollos_openclaw:/home/r0calex/desarrollos_openclaw:ro
+      # Preserve legacy /app/knowledge mount (docker-patterns + Phase 0 snapshot)
+      - /home/r0calex/ai-lab/knowledge:/app/knowledge:ro
+      # Phase 1 (2026-04-09): live mount of Claude Code auto-memory for atomic-KB indexing.
+      # Read-only — Erudito only reads, AutoDream owns writes from the host side.
+      - /home/r0calex/.claude/projects/-home-r0calex-ai-lab/memory:/app/memories/ai-lab:ro
     networks:
       - litellm-local_litellm-network
     restart: unless-stopped
@@ -41,7 +47,7 @@ services:
       - litellm-local_litellm-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8086/health')"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -17,6 +17,7 @@ _DEFAULT_ENTRY = {
     "path": None,
     "node": None,
     "repo": None,
+    "type": "repo",              # "repo" (git) or "knowledge_base" (plain folder)
     "notebook_id": None,
     "last_hash": None,
     "last_sync": None,
@@ -35,6 +36,11 @@ _DEFAULT_ENTRY = {
     "nlm_baseline": False,       # True after first successful NLM distillation
     "last_distill": None,        # ISO timestamp of last distillation (any backend)
     "last_nlm_distill": None,    # ISO timestamp of last NLM distillation
+    # --- Atomic KB extensions (Phase 1, 2026-04-09) ---
+    "atomic": False,             # If True: bypass curator + NLM, embed source files 1:1
+    "exclude_patterns": [],      # Glob basenames to skip (e.g. ["MEMORY.md"])
+    "content_hash": False,       # If True: delta uses sha256 of content (not mtime+size)
+    "scan_interval_seconds": None,  # Per-KB scan rate limit (None = use global SCAN_INTERVAL)
 }
 
 
@@ -135,7 +141,18 @@ class Registry:
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def register(self, name: str, path: str, node: str, repo: str):
+    def register(
+        self,
+        name: str,
+        path: str,
+        node: str,
+        repo: str,
+        type: str = "repo",
+        atomic: bool = False,
+        exclude_patterns: list[str] | None = None,
+        content_hash: bool = False,
+        scan_interval_seconds: int | None = None,
+    ):
         """Register a new project. Raises ValueError on duplicate name or path."""
         projects = self._data["projects"]
         if name in projects:
@@ -147,6 +164,11 @@ class Registry:
         entry["path"] = path
         entry["node"] = node
         entry["repo"] = repo
+        entry["type"] = type
+        entry["atomic"] = bool(atomic)
+        entry["exclude_patterns"] = list(exclude_patterns or [])
+        entry["content_hash"] = bool(content_hash)
+        entry["scan_interval_seconds"] = scan_interval_seconds
         projects[name] = entry
         self._persist()
 

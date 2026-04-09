@@ -7,6 +7,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import time
 import yaml
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,13 +20,16 @@ from pydantic import BaseModel
 
 from core.curator import curate_project
 from core.registry import Registry
-from core.scanner import compute_delta
+from core.scanner import compute_delta, compute_fs_delta
 from core.indexer import (
-    index_delta, ensure_collection, embed_text, search,
+    index_delta, ensure_collection, embed_text, embed_texts, search,
     upsert_points, generate_point_id,
+    chunk_text,
+    delete_by_project_and_distill_source,
     COLLECTION_NLM_NOTES,
     search_by_filter,
 )
+from core.enricher import parse_frontmatter
 from core.distiller import compute_tier, build_llm_prompt, parse_llm_response, DISTILL_QUESTIONS
 from core.distiller import DISTILL_LLM_MODEL as _LLM_MODEL, DISTILL_LLM_TIMEOUT, DISTILL_LLM_MAX_TOKENS, LITELLM_URL
 from core.query import execute_query
@@ -164,19 +169,48 @@ async def _scan_loop():
 
 
 async def _run_scan_all():
-    """Scan all projects with max concurrency limit."""
+    """Scan all projects with max concurrency limit.
+
+    Per-KB scan_interval_seconds is honored here (not in _scan_project) so that
+    manual POST /scan/{project} calls always run regardless of the rate limit.
+    """
     global _last_scan_time, _scan_semaphore
     if not registry:
         return
     if _scan_semaphore is None:
         _scan_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
 
+    now_ts = time.time()
+
+    def _is_rate_limited(name: str) -> bool:
+        entry = registry.get(name)
+        if not entry:
+            return False
+        interval = entry.get("scan_interval_seconds")
+        if not interval:
+            return False
+        last_sync = entry.get("last_sync")
+        if not last_sync:
+            return False  # never scanned → don't rate-limit first run
+        try:
+            last_ts = datetime.fromisoformat(last_sync).timestamp()
+        except (TypeError, ValueError):
+            return False
+        return (now_ts - last_ts) < interval
+
     async def _bounded_scan(name):
         async with _scan_semaphore:
             await _scan_project(name)
 
-    tasks = [_bounded_scan(name) for name in registry.list_all()]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    tasks = []
+    for name in registry.list_all():
+        if _is_rate_limited(name):
+            logger.debug(f"Skipping {name}: per-KB scan_interval not yet elapsed")
+            continue
+        tasks.append(_bounded_scan(name))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
     _last_scan_time = _now_iso()
 
 
@@ -232,15 +266,276 @@ async def _pull_remote_docs(project_name: str, entry: dict) -> bool:
         return False
 
 
+# --------------------------------------------------------------------------
+# Atomic KB pipeline (Phase 1, 2026-04-09)
+# --------------------------------------------------------------------------
+#
+# An "atomic" knowledge_base bypasses the curator (no feature merging) and the
+# NLM/LLM distillers. Each source file is embedded 1:1 into Qdrant with rich
+# payload metadata: memory_type (from frontmatter `type`), linked_project
+# (auto-derived from filename or explicit), distill_source="atomic". This is
+# designed for Claude Code auto-memory and similar atomic note collections
+# where each .md is a self-contained unit and feature-merging by filename
+# prefix would catastrophically lose granularity (e.g. 10 `project_*.md` from
+# different projects collapsing into one curated file).
+#
+# Wipe-and-rebuild semantics: every successful delta deletes all existing
+# atomic points for the project and re-indexes the current file set, so file
+# deletions and renames don't leave orphans behind.
+#
+# See docs/BACKLOG.md "Auto-Memory Integration" for the full design.
+
+ATOMIC_DISTILL_SOURCE = "atomic"
+_LINKED_PROJECT_RE = re.compile(r"^(?:project|feedback)_(.+)\.md$", re.IGNORECASE)
+
+
+def _derive_linked_project(filename: str, fm: dict) -> str | None:
+    """Derive linked_project for an atomic KB source file.
+
+    Priority:
+    1. Explicit frontmatter `linked_project` field (must match a registered project)
+    2. Filename-derived match: walk from longest to shortest prefix until a
+       registered project is found
+
+    Walking shortens at each `_` or `-` separator, so e.g.
+    `project_erudito_agentic.md` tries:
+        erudito_agentic → erudito-agentic → erudito (MATCH if `erudito` is registered)
+
+    Returns the canonical registry project name, or None if no match
+    (the file is still indexed, just without a cross-project link).
+    """
+    if not registry:
+        return None
+    explicit = fm.get("linked_project") if isinstance(fm, dict) else None
+    if explicit and registry.get(explicit):
+        return explicit
+    m = _LINKED_PROJECT_RE.match(os.path.basename(filename))
+    if not m:
+        return None
+    candidate = m.group(1).strip().lower()
+    parts = re.split(r"[-_]", candidate)
+    parts = [p for p in parts if p]  # drop empties from leading/trailing separators
+    if not parts:
+        return None
+    # Walk from longest prefix to single first token
+    for i in range(len(parts), 0, -1):
+        sub_underscore = "_".join(parts[:i])
+        if registry.get(sub_underscore):
+            return sub_underscore
+        sub_hyphen = "-".join(parts[:i])
+        if sub_hyphen != sub_underscore and registry.get(sub_hyphen):
+            return sub_hyphen
+    return None
+
+
+def _index_atomic_kb(project_name: str, files: list[dict]) -> int:
+    """Embed each source file as 1+ Qdrant chunks with rich payload metadata.
+
+    Returns total chunks upserted. Wipes existing atomic points for the
+    project before indexing so deletes/renames don't leave orphans.
+    """
+    # Wipe previous atomic points (scoped to distill_source="atomic" — we never
+    # touch points produced by other backends).
+    try:
+        delete_by_project_and_distill_source(project_name, ATOMIC_DISTILL_SOURCE)
+    except Exception as e:
+        logger.warning(f"atomic wipe failed for {project_name}: {e}")
+
+    total_chunks = 0
+    linked_count = 0
+    for file_info in files:
+        if file_info.get("action") == "deleted":
+            continue
+        content = file_info.get("content", "")
+        if not content:
+            continue
+        source = file_info["path"]
+
+        fm, _body = parse_frontmatter(content)
+        memory_type = (fm.get("type") if isinstance(fm, dict) else None) or "doc"
+        linked_project = _derive_linked_project(source, fm)
+        if linked_project:
+            linked_count += 1
+
+        chunks = chunk_text(content, source)
+        if not chunks:
+            continue
+        texts = [c["text"] for c in chunks]
+        try:
+            embeddings = embed_texts(texts)
+        except Exception as e:
+            logger.warning(f"atomic embed failed for {project_name}/{source}: {e}")
+            continue
+
+        points = []
+        for chunk, embedding in zip(chunks, embeddings):
+            point_id = generate_point_id(
+                f"{ATOMIC_DISTILL_SOURCE}:{project_name}:{source}",
+                chunk["chunk_index"],
+            )
+            payload = {
+                "text": chunk["text"],
+                "source": source,
+                "project": project_name,
+                "chunk_index": chunk["chunk_index"],
+                "offset": chunk["offset"],
+                "distill_source": ATOMIC_DISTILL_SOURCE,
+                "memory_type": memory_type,
+                "type": "atomic_kb",
+                "canonical": True,
+            }
+            if linked_project:
+                payload["linked_project"] = linked_project
+            points.append({
+                "id": point_id,
+                "vector": embedding,
+                "payload": payload,
+            })
+
+        try:
+            upsert_points(points, collection=COLLECTION_NLM_NOTES)
+            total_chunks += len(points)
+        except Exception as e:
+            logger.warning(f"atomic upsert failed for {project_name}/{source}: {e}")
+
+    logger.info(
+        f"Atomic indexed {project_name}: {total_chunks} chunks from "
+        f"{sum(1 for f in files if f.get('action') != 'deleted')} files "
+        f"({linked_count} linked to other projects)"
+    )
+    return total_chunks
+
+
+async def _process_fs_project(
+    project_name: str, source_dir: str, entry: dict, node: str,
+    extensions: set[str] | None = None,
+):
+    """Process a filesystem-based project (ingested or knowledge_base).
+
+    Runs: delta detection → sanitize → (atomic embed | curate → tier) → update registry.
+    """
+    global _auto_enriched_files, _total_scanned_files
+
+    is_atomic = bool(entry.get("atomic"))
+    exclude_patterns = entry.get("exclude_patterns") or []
+    use_content_hash = bool(entry.get("content_hash"))
+
+    delta = compute_fs_delta(
+        project_name,
+        source_dir,
+        entry.get("last_hash"),
+        extensions=extensions,
+        exclude_patterns=exclude_patterns,
+        content_hash=use_content_hash,
+    )
+    if not delta:
+        logger.info(f"No changes for fs project {project_name}")
+        return
+
+    label = "atomic_kb" if is_atomic else entry.get("type", "ingested")
+    logger.info(f"FS delta for {project_name} ({label}): {len(delta['files'])} files")
+    audit_log({"action": "delta_detected", "project": project_name,
+               "files": len(delta["files"]), "source": f"{label}:{node}"})
+
+    # Sanitize
+    for file_info in delta["files"]:
+        if file_info["content"]:
+            result = await sanitize_text(file_info["content"])
+            file_info["content"] = result["sanitized"]
+
+    # Track enrichment
+    for f in delta["files"]:
+        if f["action"] != "deleted":
+            _total_scanned_files += 1
+            if f.get("auto_enriched"):
+                _auto_enriched_files += 1
+
+    # --- Atomic path: skip curator + NLM, embed each source file 1:1 ---
+    if is_atomic:
+        try:
+            chunks_indexed = _index_atomic_kb(project_name, delta["files"])
+        except Exception as e:
+            logger.error(f"Atomic indexing failed for {project_name}: {e}")
+            audit_log({"action": "atomic_index_error", "project": project_name, "error": str(e)})
+            return
+        live_files = len([f for f in delta["files"] if f["action"] != "deleted"])
+        registry.update_sync(project_name, delta["new_hash"], doc_count=live_files)
+        registry.update_fields(
+            project_name,
+            curation_status="atomic",
+            curated_at=_now_iso(),
+            curated_files=live_files,
+            computed_tier=2,  # Tier 2 semantically: LLM-grade quality, no NLM
+            last_distill=_now_iso(),
+            status="synced",
+        )
+        audit_log({
+            "action": "atomic_index_complete",
+            "project": project_name,
+            "files": live_files,
+            "chunks": chunks_indexed,
+            "source": f"{label}:{node}",
+        })
+        return
+
+    # --- Standard path: curate → tier ---
+    try:
+        curation_result = curate_project(project_name, source_dir, delta["files"], CURATED_DIR)
+        if curation_result.success and curation_result.curated_files > 0:
+            proj = registry._data["projects"].get(project_name)
+            if proj:
+                proj["curation_status"] = "curated"
+                proj["curated_at"] = _now_iso()
+                proj["curated_files"] = curation_result.curated_files
+                registry._persist()
+            registry.update_sync(project_name, delta["new_hash"],
+                                 doc_count=len([f for f in delta["files"] if f["action"] != "deleted"]))
+            audit_log({"action": "curation_complete", "project": project_name,
+                       "features": curation_result.features, "source": f"{label}:{node}"})
+            logger.info(f"Curated {project_name} ({label}/{node}): {curation_result.curated_files} features")
+            computed = compute_tier(project_name, os.path.join(CURATED_DIR, project_name), entry)
+            registry.update_fields(project_name, computed_tier=computed)
+            logger.info(f"Tier for {project_name}: {computed} ({curation_result.curated_files} features)")
+    except Exception as e:
+        logger.error(f"Curation failed for {label} {project_name}: {e}")
+
+
 async def _scan_project(project_name: str):
     """Scan a single project for changes. Handles both local and remote projects."""
+    global _auto_enriched_files, _total_scanned_files
+
     entry = registry.get(project_name)
     if not entry:
         return
 
     node = entry.get("node", LOCAL_NODE)
     is_remote = node != LOCAL_NODE and node in NODE_DEVOPS_AGENTS
+    project_path = os.path.expanduser(entry.get("path", ""))
+    is_ingested = INGESTED_DIR in project_path or (
+        Path(INGESTED_DIR) / project_name
+    ).is_dir()
+    is_knowledge_base = entry.get("type") == "knowledge_base"
 
+    # Route 0: Knowledge base (plain folder, no git)
+    if is_knowledge_base:
+        kb_dir = os.path.expanduser(entry.get("path", ""))
+        if not os.path.isdir(kb_dir):
+            logger.warning(f"Knowledge base dir not found for {project_name}: {kb_dir}")
+            return
+        from core.scanner import KB_EXTENSIONS
+        await _process_fs_project(project_name, kb_dir, entry, node, extensions=KB_EXTENSIONS)
+        return
+
+    # Route 1: Ingested project (files on disk, no git repo)
+    if is_ingested:
+        ingest_dir = Path(INGESTED_DIR) / project_name
+        if not ingest_dir.is_dir():
+            logger.warning(f"Ingested dir not found for {project_name}: {ingest_dir}")
+            return
+        await _process_fs_project(project_name, str(ingest_dir), entry, node)
+        return
+
+    # Route 2: Remote project (pull via devops-agent, then curate)
     if is_remote:
         # Remote project: pull docs via devops-agent, then curate from ingested dir
         pulled = await _pull_remote_docs(project_name, entry)
@@ -291,7 +586,7 @@ async def _scan_project(project_name: str):
             logger.error(f"Curation failed for remote {project_name}: {e}")
         return
 
-    # Local project: standard scan
+    # Route 3: Local project (standard git scan)
     repo_path = os.path.expanduser(entry["path"])
     if not os.path.isdir(repo_path):
         logger.warning(f"Path not found for {project_name}: {repo_path}")
@@ -313,7 +608,6 @@ async def _scan_project(project_name: str):
                 logger.info(f"Sanitized {result['masked_count']} secrets in {file_info['path']}")
 
     # Track auto-enrichment for metadata compliance metric
-    global _auto_enriched_files, _total_scanned_files
     for f in delta["files"]:
         if f["action"] != "deleted":
             _total_scanned_files += 1
@@ -405,7 +699,13 @@ async def _run_distill_all():
     candidates = []
     for name in registry.list_all():
         entry = registry.get(name)
-        if not entry or entry.get("curation_status") != "curated":
+        if not entry:
+            continue
+        # Atomic projects are indexed inline in the scan loop (no curate, no NLM,
+        # no LLM distillation step). Skip them entirely from the distill loop.
+        if entry.get("atomic"):
+            continue
+        if entry.get("curation_status") != "curated":
             continue
         # Skip if already distilled after last curation
         last_distill = entry.get("last_distill")
@@ -879,60 +1179,147 @@ async def register_project(data: dict):
     path = data.get("path")
     node = data.get("node", "hanzo")
     repo = data.get("repo", "")
+    project_type = data.get("type", "repo")
+    # Atomic KB extensions (Phase 1, 2026-04-09)
+    atomic = bool(data.get("atomic", False))
+    exclude_patterns = data.get("exclude_patterns") or []
+    content_hash = bool(data.get("content_hash", False))
+    scan_interval_seconds = data.get("scan_interval_seconds")
 
     if not name or not path:
         raise HTTPException(400, "name and path are required")
+
+    if project_type not in ("repo", "knowledge_base"):
+        raise HTTPException(400, "type must be 'repo' or 'knowledge_base'")
+
+    if atomic and project_type != "knowledge_base":
+        raise HTTPException(400, "atomic=true requires type='knowledge_base'")
+
+    if not isinstance(exclude_patterns, list) or not all(isinstance(p, str) for p in exclude_patterns):
+        raise HTTPException(400, "exclude_patterns must be a list of strings")
+
+    if scan_interval_seconds is not None:
+        try:
+            scan_interval_seconds = int(scan_interval_seconds)
+            if scan_interval_seconds < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(400, "scan_interval_seconds must be a positive integer")
 
     expanded = os.path.expanduser(path)
     if not os.path.isdir(expanded):
         raise HTTPException(400, f"Path does not exist: {path}")
 
-    from core.scanner import find_git_root
-    if not find_git_root(expanded):
-        raise HTTPException(400, f"Path is not a git repository: {path}")
+    if project_type == "repo":
+        from core.scanner import find_git_root
+        if not find_git_root(expanded):
+            raise HTTPException(400, f"Path is not a git repository: {path}")
 
     try:
-        registry.register(name, path, node, repo)
+        registry.register(
+            name, path, node, repo,
+            type=project_type,
+            atomic=atomic,
+            exclude_patterns=exclude_patterns,
+            content_hash=content_hash,
+            scan_interval_seconds=scan_interval_seconds,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    return {"status": "registered", "project": name}
+    return {
+        "status": "registered",
+        "project": name,
+        "type": project_type,
+        "atomic": atomic,
+    }
 
 
 # --- Ingest Endpoint (for remote nodes) ---
+
+
+MAX_INGEST_FILE_SIZE = 1 * 1024 * 1024  # 1MB per file
+MAX_INGEST_BATCH_SIZE = 200  # max files per request
+
+
+def _validate_ingest_path(filepath: str) -> str | None:
+    """Validate and normalize an ingest file path. Returns None if invalid."""
+    if not filepath or not isinstance(filepath, str):
+        return None
+    # Reject absolute paths and path traversal
+    if filepath.startswith("/") or ".." in filepath.split("/"):
+        return None
+    # Normalize and reject if it escapes
+    normalized = os.path.normpath(filepath)
+    if normalized.startswith("..") or normalized.startswith("/"):
+        return None
+    return normalized
+
+
+def _parse_ingest_files(data: dict) -> list[tuple[str, str]]:
+    """Parse files from ingest request. Supports dict and list formats.
+
+    Dict format: {"files": {"path/to/file.md": "content", ...}}
+    List format: {"files": [{"path": "file.md", "content": "..."}, ...]}
+
+    Returns list of (filepath, content) tuples.
+    """
+    files = data.get("files", {})
+    if isinstance(files, dict):
+        return [(k, v) for k, v in files.items() if isinstance(v, str)]
+    elif isinstance(files, list):
+        result = []
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            path = f.get("path") or f.get("filename") or f.get("name")
+            content = f.get("content", "")
+            if path and content:
+                result.append((path, content))
+        return result
+    return []
 
 
 @app.post("/ingest/{project}")
 async def ingest_endpoint(project: str, data: dict):
     """Ingest documentation files from remote nodes.
 
-    Accepts: {"files": [{"path": "filename.md", "content": "...", "node": "kubo"}]}
-    Stores files in data/ingested/{project}/ for the curator to process.
-    Optionally triggers curation if auto_curate=true.
+    Accepts dict format: {"files": {"docs/spec/SPEC.md": "content", ...}, "node": "sariatu"}
+    Also accepts list format: {"files": [{"path": "file.md", "content": "..."}], "node": "sariatu"}
+    Stores files in data/ingested/{project}/ preserving directory structure.
     """
     if not registry:
         raise HTTPException(503, "Registry not initialized")
 
-    files = data.get("files", [])
-    if not files:
-        raise HTTPException(400, "No files provided")
+    parsed_files = _parse_ingest_files(data)
+    if not parsed_files:
+        raise HTTPException(400, "No files provided. Use dict {path: content} or list [{path, content}] format.")
+
+    if len(parsed_files) > MAX_INGEST_BATCH_SIZE:
+        raise HTTPException(413, f"Too many files ({len(parsed_files)}). Max {MAX_INGEST_BATCH_SIZE} per request.")
 
     node = data.get("node", "unknown")
     auto_curate = data.get("auto_curate", False)
 
-    # Store ingested files
     ingest_dir = Path(INGESTED_DIR) / project
     ingest_dir.mkdir(parents=True, exist_ok=True)
 
     stored = 0
-    for f in files:
-        filename = f.get("path") or f.get("filename")
-        content = f.get("content", "")
-        if not filename or not content:
+    rejected = []
+    for filepath, content in parsed_files:
+        safe_path = _validate_ingest_path(filepath)
+        if not safe_path:
+            rejected.append(filepath)
             continue
-        # Use basename only to avoid path traversal
-        safe_name = os.path.basename(filename)
-        (ingest_dir / safe_name).write_text(content, encoding="utf-8")
+        if len(content.encode("utf-8")) > MAX_INGEST_FILE_SIZE:
+            rejected.append(filepath)
+            continue
+        if not content.strip():
+            continue
+
+        target = ingest_dir / safe_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
         stored += 1
 
     audit_log({
@@ -940,27 +1327,35 @@ async def ingest_endpoint(project: str, data: dict):
         "project": project,
         "node": node,
         "files": stored,
+        "rejected": len(rejected),
     })
-    logger.info(f"Ingested {stored} files for {project} from {node}")
+    logger.info(f"Ingested {stored} files for {project} from {node} ({len(rejected)} rejected)")
 
-    # Register project if not exists
+    # Register or update project
     entry = registry.get(project)
     if not entry:
-        # Register with ingested path as the project path
         registry._data["projects"][project] = {
             **dict(__import__('core.registry', fromlist=['_DEFAULT_ENTRY'])._DEFAULT_ENTRY),
             "path": str(ingest_dir),
             "node": node,
+            "status": "pending",
         }
         registry._persist()
         logger.info(f"Auto-registered project '{project}' from node {node}")
+    else:
+        proj = registry._data["projects"].get(project)
+        if proj:
+            proj["node"] = node
+            proj["status"] = "pending"
+            proj["doc_count"] = sum(1 for _ in ingest_dir.rglob("*.md"))
+            registry._persist()
 
     # Curate the ingested files directly (they're already .md, no need for scanner)
     if auto_curate and stored > 0:
         delta_files = []
-        for md_file in sorted(ingest_dir.glob("*.md")):
+        for md_file in sorted(ingest_dir.rglob("*.md")):
             delta_files.append({
-                "path": md_file.name,
+                "path": str(md_file.relative_to(ingest_dir)),
                 "content": md_file.read_text(encoding="utf-8"),
                 "action": "added",
             })
@@ -984,13 +1379,65 @@ async def ingest_endpoint(project: str, data: dict):
             "features": curation_result.features,
         }
 
-    return {
+    resp = {
         "status": "ingested",
         "project": project,
         "node": node,
         "files_stored": stored,
-        "message": f"Use POST /curate/{project} to process",
     }
+    if rejected:
+        resp["rejected"] = rejected
+    return resp
+
+
+@app.delete("/ingest/{project}")
+async def delete_ingest_endpoint(project: str, prefix: str | None = Query(default=None)):
+    """Delete ingested files for a project.
+
+    If prefix is given, only files under that prefix are removed.
+    If no prefix, all ingested files for the project are removed.
+    """
+    if not registry:
+        raise HTTPException(503, "Registry not initialized")
+
+    ingest_dir = Path(INGESTED_DIR) / project
+    if not ingest_dir.exists():
+        return {"status": "deleted", "project": project, "files_removed": 0}
+
+    removed = 0
+    if prefix:
+        safe_prefix = _validate_ingest_path(prefix)
+        if not safe_prefix:
+            raise HTTPException(400, f"Invalid prefix: {prefix}")
+        target_dir = ingest_dir / safe_prefix
+        if target_dir.is_dir():
+            for f in list(target_dir.rglob("*")):
+                if f.is_file():
+                    f.unlink()
+                    removed += 1
+            # Clean up empty directories
+            for d in sorted(target_dir.rglob("*"), reverse=True):
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            if target_dir.exists() and not any(target_dir.iterdir()):
+                target_dir.rmdir()
+        elif target_dir.is_file():
+            target_dir.unlink()
+            removed = 1
+    else:
+        for f in list(ingest_dir.rglob("*")):
+            if f.is_file():
+                f.unlink()
+                removed += 1
+        # Clean up empty directories
+        for d in sorted(ingest_dir.rglob("*"), reverse=True):
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+
+    audit_log({"action": "delete_ingest", "project": project, "prefix": prefix, "files_removed": removed})
+    logger.info(f"Deleted {removed} ingested files for {project} (prefix={prefix})")
+
+    return {"status": "deleted", "project": project, "files_removed": removed}
 
 
 # --- Classify Endpoint ---
@@ -1084,8 +1531,12 @@ async def curate_endpoint(project: str, force_nlm: bool = Query(False)):
     if not os.path.isdir(repo_path):
         raise HTTPException(400, f"Path not found: {repo_path}")
 
-    # Step 1: Scan for delta
-    delta = compute_delta(project, repo_path, entry.get("last_hash"))
+    # Step 1: Scan for delta (git or filesystem)
+    is_ingested = INGESTED_DIR in repo_path
+    if is_ingested:
+        delta = compute_fs_delta(project, repo_path, entry.get("last_hash"))
+    else:
+        delta = compute_delta(project, repo_path, entry.get("last_hash"))
     if delta:
         # Sanitize
         for file_info in delta["files"]:
@@ -1169,7 +1620,8 @@ async def search_endpoint(
     q: str = Query(..., min_length=1),
     project: str | None = Query(default=None),
     top_k: int = Query(default=5, ge=1, le=50),
-    mode: str = Query(default="default", regex="^(default|dual)$"),
+    mode: str = Query(default="default", pattern="^(default|dual|agent|agentic)$"),
+    max_tokens: int = Query(default=800, ge=100, le=4000),
 ):
     _query_stats["total"] += 1
     result = await execute_query(
@@ -1179,6 +1631,7 @@ async def search_endpoint(
         nlm_client=nlm,
         registry=registry,
         mode=mode,
+        max_tokens=max_tokens,
     )
     if result.get("confidence") == "high":
         _query_stats["high"] += 1
