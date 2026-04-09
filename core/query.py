@@ -20,11 +20,19 @@ CONFIDENCE_THRESHOLD = float(os.getenv("ERUDITO_CONFIDENCE_THRESHOLD", "0.75"))
 NLM_SCORE_BOOST = 0.05
 
 # Agentic search config
-AGENTIC_MODEL = os.getenv("AGENTIC_LLM_MODEL", "openai/zen/minimax-m2.5-free")
+AGENTIC_MODEL = os.getenv("AGENTIC_LLM_MODEL", "openai/go/minimax-m2.7")
 AGENTIC_DECOMPOSE_TIMEOUT = int(os.getenv("AGENTIC_DECOMPOSE_TIMEOUT", "8"))
 AGENTIC_SYNTH_TIMEOUT = int(os.getenv("AGENTIC_SYNTH_TIMEOUT", "12"))
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 LITELLM_KEY = os.getenv("LITELLM_MASTER_KEY", "")
+
+# NLM live-query path toggle (2026-04-09): disabled by default because the
+# query_notebook endpoint hits a Google "account-level restrictions on
+# programmatic access" error even with fresh cookies, while the distillation
+# path (run_nlm_cycle) works fine. Until we re-evaluate, skip any live NLM
+# Q&A and let callers fall back to Qdrant-only results. Set
+# NLM_QUERY_ENABLED=true in env to re-enable.
+NLM_QUERY_ENABLED = os.getenv("NLM_QUERY_ENABLED", "false").lower() == "true"
 
 # Alias map: common names/keywords → canonical project name in registry.
 # Checked when the query doesn't contain an exact project name.
@@ -298,40 +306,42 @@ async def execute_query(
     if best_score >= CONFIDENCE_THRESHOLD:
         return build_response(query, top_results, project_identified=project)
 
-    # Low confidence → try NLM live if available
-    notebook_id = None
-    if project and registry:
-        entry = registry.get(project)
-        if entry:
-            notebook_id = entry.get("notebook_id")
+    # Low confidence → try NLM live if available.
+    # Gated by NLM_QUERY_ENABLED (default False) — see top of module for why.
+    if NLM_QUERY_ENABLED:
+        notebook_id = None
+        if project and registry:
+            entry = registry.get(project)
+            if entry:
+                notebook_id = entry.get("notebook_id")
 
-    if notebook_id and nlm_client:
-        try:
-            nlm_answer = await nlm_client.query_notebook(notebook_id, query)
-            if nlm_answer:
-                note_embedding = embed_text(f"{query} {nlm_answer[:200]}")
-                point_id = generate_point_id(f"nlm_live:{project}:{query[:50]}", 0)
-                upsert_points([{
-                    "id": point_id,
-                    "vector": note_embedding,
-                    "payload": {
-                        "text": nlm_answer,
-                        "source": f"nlm_live:{query[:80]}",
-                        "project": project,
-                        "distill_source": "nlm",
-                        "from_nlm": True,  # backwards compat
-                        "chunk_index": 0,
-                    },
-                }], COLLECTION_NLM_NOTES)
+        if notebook_id and nlm_client:
+            try:
+                nlm_answer = await nlm_client.query_notebook(notebook_id, query)
+                if nlm_answer:
+                    note_embedding = embed_text(f"{query} {nlm_answer[:200]}")
+                    point_id = generate_point_id(f"nlm_live:{project}:{query[:50]}", 0)
+                    upsert_points([{
+                        "id": point_id,
+                        "vector": note_embedding,
+                        "payload": {
+                            "text": nlm_answer,
+                            "source": f"nlm_live:{query[:80]}",
+                            "project": project,
+                            "distill_source": "nlm",
+                            "from_nlm": True,  # backwards compat
+                            "chunk_index": 0,
+                        },
+                    }], COLLECTION_NLM_NOTES)
 
-                return build_response(
-                    query, top_results,
-                    nlm_answer=nlm_answer,
-                    nlm_consulted=True,
-                    project_identified=project,
-                )
-        except Exception as e:
-            logger.warning(f"NLM query failed: {e}")
+                    return build_response(
+                        query, top_results,
+                        nlm_answer=nlm_answer,
+                        nlm_consulted=True,
+                        project_identified=project,
+                    )
+            except Exception as e:
+                logger.warning(f"NLM query failed: {e}")
 
     return build_response(query, top_results, nlm_consulted=False, project_identified=project)
 
@@ -361,26 +371,29 @@ async def _execute_dual(
         ],
     }
 
-    # NLM live query
+    # NLM live query (gated by NLM_QUERY_ENABLED, default False — see top of module)
     nlm_live_answer = {"answer": None, "notebook_id": None, "source": "notebooklm"}
-    notebook_id = None
-    if project and registry:
-        entry = registry.get(project)
-        if entry:
-            notebook_id = entry.get("notebook_id")
+    if not NLM_QUERY_ENABLED:
+        nlm_live_answer["answer"] = "NLM live query disabled (NLM_QUERY_ENABLED=false)"
+    else:
+        notebook_id = None
+        if project and registry:
+            entry = registry.get(project)
+            if entry:
+                notebook_id = entry.get("notebook_id")
 
-    if notebook_id and nlm_client:
-        try:
-            answer = await nlm_client.query_notebook(notebook_id, query)
-            nlm_live_answer = {
-                "answer": answer,
-                "notebook_id": notebook_id,
-                "source": "notebooklm",
-            }
-        except Exception as e:
-            nlm_live_answer["answer"] = f"NLM query failed: {e}"
-    elif not notebook_id:
-        nlm_live_answer["answer"] = "No notebook available for this project"
+        if notebook_id and nlm_client:
+            try:
+                answer = await nlm_client.query_notebook(notebook_id, query)
+                nlm_live_answer = {
+                    "answer": answer,
+                    "notebook_id": notebook_id,
+                    "source": "notebooklm",
+                }
+            except Exception as e:
+                nlm_live_answer["answer"] = f"NLM query failed: {e}"
+        elif not notebook_id:
+            nlm_live_answer["answer"] = "No notebook available for this project"
 
     return {
         "mode": "dual",

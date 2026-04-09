@@ -23,9 +23,14 @@ TIER1_THRESHOLD = int(os.getenv("TIER1_THRESHOLD", "5"))
 TIER2_THRESHOLD = int(os.getenv("TIER2_THRESHOLD", "3"))
 
 # LLM config
-DISTILL_LLM_MODEL = os.getenv("DISTILL_LLM_MODEL", "openai/zen/minimax-m2.5")
-DISTILL_LLM_TIMEOUT = int(os.getenv("DISTILL_LLM_TIMEOUT", "120"))
-DISTILL_LLM_MAX_TOKENS = int(os.getenv("DISTILL_LLM_MAX_TOKENS", "4000"))
+# Default model: go/minimax-m2.7 (thinking/reasoning model via the active go
+# subscription pool). Migrated from zen/minimax-m2.5 on 2026-04-09 when the
+# zen credit pool drained — see memory/feedback_use_go_not_zen.md. Defaults
+# to the thinking model budget (higher tokens, longer timeout) because m2.7
+# burns ~40+ tokens on internal reasoning before producing content.
+DISTILL_LLM_MODEL = os.getenv("DISTILL_LLM_MODEL", "openai/go/minimax-m2.7")
+DISTILL_LLM_TIMEOUT = int(os.getenv("DISTILL_LLM_TIMEOUT", "180"))
+DISTILL_LLM_MAX_TOKENS = int(os.getenv("DISTILL_LLM_MAX_TOKENS", "8000"))
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 
 # Match each top-level answer start: captures the number (1-5)

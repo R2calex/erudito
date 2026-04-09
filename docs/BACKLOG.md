@@ -3,6 +3,16 @@
 ## Critical (next session)
 
 - [ ] **Registry thread safety**: Replace all 13 direct `registry._data["projects"]` mutations in main.py with `registry.update_fields()`. The method exists but isn't used yet. Concurrent scan/NLM tasks can corrupt state. (review #2)
+- [ ] **API authentication**: No auth on any write endpoint (`/registry`, `/ingest`, `/classify`, `/nlm/reset`, `/scan`, `/curate`, `/feedback`). Today relies entirely on Tailscale network ACL. Adding new endpoints in Phase 1 (atomic KB) made this worse — more surface without design. Needs proper design (token vs mTLS vs header) before next PR that adds endpoints.
+
+## Post Phase 1 follow-ups (2026-04-09, no bloqueantes)
+
+These surfaced during the atomic-KB deploy and the zen→go migration but were kept out of their respective commits to avoid scope creep:
+
+- [ ] **Distiller parser fragility with thinking models**: `core/distiller.py:parse_llm_response` expects exactly 5 sequential `Q1:/Q2:/...` answers. The new `go/minimax-m2.7` thinking model occasionally returns 4 of 5 (observed for jasper on first attempt; second attempt worked). Needs a tolerant parser that accepts partial responses, or an explicit retry with a stricter prompt. First failure manifested on 2026-04-09 after the zen→go switch — see commit `fix(distill): switch LLM model`.
+- [ ] **Reset stale `nlm_consecutive_failures` counters**: 14 tier-1 projects still show 28+ historical failures from a 2026-03-24 NLM burst. NLM is working now (verified 2026-04-09 after cookie refresh), so these counters are noise. Either wipe them in bulk via a one-shot endpoint or let them decay on next successful distill. Affects the audit UX more than actual behavior.
+- [ ] **NLM live query path (`query_notebook`)** returns `INVALID_ARGUMENT / account-level restrictions on programmatic access` even with fresh cookies, while `run_nlm_cycle` (distillation) works fine for the same account. Disabled via `NLM_QUERY_ENABLED=false` default (2026-04-09). Re-evaluate: is this an account flag, a specific endpoint restriction, or a temporary Google-side issue? Decide whether to (a) flip the default back on when it clears, (b) remove the path entirely, or (c) try a different account.
+- [ ] **DELETE / PATCH /registry endpoints**: Re-registering a project with different config currently requires editing `data/registry.yaml` by hand and bumping `version:` higher than what Redis holds (Redis dual-write reconciler takes highest version on load). Fragile and undocumented. Needed for any future atomic-KB config tweaks and for the tests under `test-ingest` / `test-delete` that can't clean up after themselves.
 - [x] **Run tier migration**: ~~Execute `python scripts/migrate-tiers.py`~~ — Done. Tiers assigned, Qdrant migrated, legacy cleanup complete.
 - [x] **Legacy cleanup**: ~~agent_knowledge collection, orphan points, dead code~~ — Done (commit 0a6cf6d).
 
